@@ -1,0 +1,27 @@
+profile: au_codes
+windows:
+  preoff_open_min: -60
+  preoff_hot_min: -15
+admission:
+  min_spread_ticks: 1
+  min_depth_best2: 150
+persistence:
+  default: CANCEL
+fees:
+  commission_pct: 0.05
+edges:
+  fee_gate:
+    fee_ticks: 0.5
+    slippage_ticks: 0.3
+    cushion_ticks: 0.2
+in_play:
+  allow_maker: false
+  bet_delay_max_s: 2
+  bet_delay_overrides:
+    long_delay_models: []
+    disable_edges:
+      - maker_thick_trend
+      - maker_thin
+sp:
+  take_sp_enabled: false
+  min_liability_abs: 10.0

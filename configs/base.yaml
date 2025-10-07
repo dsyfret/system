@@ -1,0 +1,152 @@
+app:
+  name: betfair
+  timezone: Australia/Melbourne
+betfair:
+  commission_pct_default: 0.05
+  max_concurrent_hot: 12
+  stream_levels: 3
+  auth:
+    mode: cert
+    sso_host: https://identitysso.betfair.com/api/
+    username: ''
+    password: ''
+    cert_file: ''
+    key_file: ''
+  rest:
+    base_url: https://api.betfair.com/exchange/betting/rest/v1.0/
+    timeout_s: 10
+  account:
+    base_url: https://api.betfair.com/exchange/account/json-rpc/v1
+    wallet: AUS
+  betting:
+    jsonrpc_url: https://api.betfair.com/exchange/betting/json-rpc/v1
+    timeout_s: 8
+  streaming:
+    include_virtual: true
+    include_raw: true
+    ladder_levels: 3
+    heartbeat_ms: 2500
+    backoff_ms:
+    - 500
+    - 1000
+    - 2000
+    - 5000
+    - 10000
+    resubscribe_chunk: 50
+  orders_stream:
+    enabled: true
+    ws_url: wss://stream-api.betfair.com:443/ws
+    heartbeat_ms: 5000
+  orders:
+    page_size: 200
+  orders_poll:
+    interval_s: 1.0
+  heartbeat:
+    enabled: true
+    preferred_timeout_s: 30
+ipc:
+  transport: inproc
+  intents_topic: intents.v1
+  reports_topic: reports.v1
+slo:
+  decision_ack_p50_ms: 60
+  decision_ack_p95_ms: 120
+logging:
+  level: INFO
+  file: logs/betfair.log
+  retention_days: 14
+metrics:
+  enabled: true
+  port: 8008
+  stream_stale_warn_ms: 10000
+  ack_p95_warn_ms: 120000
+  fee_share_warn: 0.35
+  messages_per_gbp_warn: 80
+  replace_place_warn: 2.5
+  funds:
+    # Use one scale; both are accepted by alerts:
+    # - fraction: 0.05  (== 5%)
+    # - percent : 5.0   (== 5%)
+    mismatch_pct: 5.0
+    mismatch_secs: 30.0
+execution:
+  dry_run: true
+  suspend:
+    cancel_after_s: 120
+  policies:
+    persistence:
+      sp:
+        enabled: true
+        min_liability_abs: 5.0
+        side_rules:
+          BACK: CANCEL_BELOW_MIN
+          LAY: CANCEL_BELOW_MIN
+risk:
+  new_risk_per_min_abs: 0.0
+accounts:
+  poll:
+    interval_s: 20
+  funds_buffer_abs: 0.0
+  funds_buffer_pct: 0.0
+simulator:
+  record:
+    enabled: true
+    dir: logs/sim
+    snap_interval_s: 10
+    max_file_mb: 200
+    max_files: 10
+    normalize_ws: true        # NEW: emit 'delta' lines for each mcm.mc[] item
+    write_raw_ws: true       # NEW: also keep 'type: ws' raw messages (optional)
+    delta_file_prefix: wsdelta  # NEW: separate rolling file prefix for delta lines
+discovery:
+  refresh_interval_s: 180
+  horizon_hours: 24
+  slice_hours: 3
+  min_slice_seconds: 300
+  grace_post_off_s: 1200     # 20 minutes after off
+  max_staleness_s: 900       # alert if no refresh > 15m
+  unsubscribe_enabled: true
+  event_type_ids: [7]          # 7 = Horse Racing; add others to include sports; [] is all events (including sports)
+  market_types: [WIN, PLACE]   # extend as needed (e.g., MATCH_ODDS, OVER_UNDER_25, etc.); [] is all market types for the selected event types
+  country_codes: []            # [] = all countries; set to [GB, IE] for London focus
+  max_results: 1000
+edges:
+  # 🔌 What’s actually ON right now (order = precedence we’ll use in Step 2)
+  enabled: [suspend_reopen, maker, parity]
+
+  # 📦 Catalog of planned edges (safe to include even if the module doesn’t exist yet;
+  # they won’t be imported unless listed in `enabled`)
+  registry:
+    maker:          src.strategy.edges.maker:MakerEdge                 # primary
+    parity:         src.strategy.edges.parity:ParityEdge               # Parity++ lives here today
+    suspend_reopen: src.strategy.edges.suspend_reopen:SuspendReopenEdge
+    maker_thin:     src.strategy.edges.maker_thin:MakerThinEdge        # planned OFF
+    mean_revert:    src.strategy.edges.mean_revert:MeanRevertEdge      # planned OFF
+    bsp_gravity:    src.strategy.edges.bsp_gravity:BspGravityEdge      # future, OFF
+    xmsr:           src.strategy.edges.xmsr:XMSREdge                   # future, OFF
+
+  # Maker overlays: all OFF so you can validate clean Maker first
+  maker:
+    overlays:
+      dwell_bias:    false
+      sweep_sniffer: false
+      cadence:       false
+      trend_nudge:   false
+      stacking:      false
+    hedge:
+      enabled: true
+      cushion_ticks: 1
+      ttl_ms: 3000
+arbiter:
+  # Map edge names → lanes (exact match; lowercased internally)
+  lane_of:
+    suspend_reopen: suspend_reopen
+    maker:          maker
+    parity:         cross_market
+    maker_thin:     maker           # planned, currently off
+    mean_revert:    mean_revert     # planned, currently off
+    bsp_gravity:    cross_market    # future
+    xmsr:           xmsr            # future
+
+  # Lane precedence (highest first). Matches your chosen suite today.
+  lane_priority: [suspend_reopen, maker, cross_market, mean_revert, xmsr] 

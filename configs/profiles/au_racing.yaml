@@ -1,0 +1,34 @@
+profile: au_racing
+windows:
+  preoff_open_min: -15
+  preoff_hot_min: -5
+admission:
+  min_spread_ticks: 2
+  min_depth_best2: 200
+persistence:
+  default: KEEP
+fees:
+  commission_pct: 0.08
+edges:
+  fee_gate:
+    fee_ticks: 0.6
+    slippage_ticks: 0.3
+    cushion_ticks: 0.2
+in_play:
+  bet_delay_overrides:
+    bet_delay_max_s: 6
+    long_delay_models: []
+    disable_edges:
+      - maker_thick_trend
+      - maker_thin
+sp:
+  take_sp_enabled: true
+  min_liability_abs: 10.0
+
+discovery:
+  refresh_interval_min: 10
+  horizon_hours: 24
+  market_types: [WIN, PLACE]
+  country_codes: [AU]
+  max_results: 1000
+  slice_hours: 3

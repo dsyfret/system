@@ -1,0 +1,6 @@
+messages:
+  per_market_max_per_sec: 8
+  global_max_per_sec: 60
+replaces:
+  min_interval_ms: 2000
+  widen_trigger_ticks: 1

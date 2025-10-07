@@ -1,0 +1,22 @@
+{
+  "name": "template-CE-07-MBR",
+  "description": "MBR effects on final size \u2014 replace 'books' with a real listMarketBook snapshot + set expectations.",
+  "sequence": [
+    {
+      "ts_ms": 1695401234000,
+      "type": "reseed",
+      "books": []
+    }
+  ],
+  "assert": {
+    "expect_intents_at_end": {
+      "count": 1
+    },
+    "expect_size_at_end": {
+      "runner": "12345",
+      "side": "BACK",
+      "approx": 2.34,
+      "tolerance": 0.05
+    }
+  }
+}

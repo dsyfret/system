@@ -1,0 +1,50 @@
+bankroll:
+  per_market_max_pct: 0.008
+  per_minute_new_risk_pct: 0.03
+  per_region_active_pct: 0.3
+drawdown:
+  stepdowns:
+  - dd_pct: 0.08
+    size_mult: 0.75
+  - dd_pct: 0.12
+    size_mult: 0.5
+  restore_rate_per_month: 0.1
+kill_switches:
+  stream_stale_ms: 4000
+  ack_p95_ms: 150
+  pnl_shock_abs: 0.0
+  dd_stop_pct: 0.0
+actions:
+  on_stream_stale: PAUSE
+  on_ack_slow: PAUSE
+  on_pnl_shock: FLATTEN
+  on_dd_stop: FREEZE
+heartbeat_timeout_s: 30
+new_risk_per_min_abs: 0.0
+edges:
+  suspend_reopen:
+    max_daily_var_pct: 0.1
+funds:
+  poll_s: 20
+  free_buffer_pct: 0.15
+  mismatch_pct: 0.1
+  mismatch_secs: 30
+risk:
+  bankroll:
+    source: fixed
+    fixed_amount: 100.0
+    live_haircut_pct: 10
+  size_decision_records:
+    enabled: false
+  funds:
+    free_buffer_pct: 15
+    poll_s: 20
+    mismatch_pct: 5
+    mismatch_secs: 30
+  new_risk_per_min_abs: 50.0
+  bet_delay:
+    max_allowed_ms: 2000
+  min_stake: 2.0
+  odds:
+    min: 1.01
+    max: 1000.0

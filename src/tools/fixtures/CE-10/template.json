@@ -1,0 +1,25 @@
+{
+  "name": "template-CE-10-parity-freshness",
+  "description": "Parity only when both legs are fresh \u2014 add deltas to cross freshness thresholds; set 'until' index.",
+  "sequence": [
+    {
+      "ts_ms": 1695401234000,
+      "type": "reseed",
+      "books": []
+    },
+    {
+      "ts_ms": 1695401235000,
+      "type": "mcm",
+      "delta": {
+        "market_id": ""
+      }
+    }
+  ],
+  "assert": {
+    "expect_no_intents_until_step": 1,
+    "expect_intents_at_end": {
+      "count": 1
+    },
+    "expect_bundle_policy_at_end": "ALL_OR_CANCEL"
+  }
+}

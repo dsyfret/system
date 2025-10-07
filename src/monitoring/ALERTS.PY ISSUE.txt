@@ -1,0 +1,1 @@
+Alerts.py was missing on 30/9/25 - I asked betfair thread 12 to see if they could recall it. They could, but I'm not sure how sound it is. Worth checking further up betfair thread 12 to see if any other versions; i also have previous zipped versions from around 23/9/25

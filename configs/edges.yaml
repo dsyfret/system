@@ -1,0 +1,101 @@
+edges:
+  maker:
+    enabled: true
+    default_size: 2.0
+    min_spread_ticks: 2
+    min_depth_best2: 200
+    min_lifetime_ms: 2000
+    ev_assume_ticks: 0.8
+    ev_divergence_boost: 0.2
+    fallback_mode: observer
+    fallback_size_mult: 0.5
+    params:
+      A:
+        fallback_mode: false
+      B:
+        fallback_mode: live
+    stack:
+      enabled: true
+      min_raw_best2_sum: 400
+      max_spread_ticks: 6
+      size_mult: 0.3
+      ttl_bump_ms: 400
+      liability_cap_per_runner: 5.0
+      max_quotes_per_lane_per_market: 2
+    hedge:
+      enabled: true
+      cushion_ticks: 1
+      ttl_ms: 3000
+  mean_revert:
+    enabled: false
+    default_size: 1.0
+    ttl_ms: 1500
+    band_ticks_min: 1.0
+    band_ticks_max: 1.5
+    max_spread_ticks: 6
+    min_raw_best2_sum: 250
+    slope_suppress_abs: 0.8
+    max_candidates: 2
+    bundle_policy: BEST_EFFORT
+  sp_gravity:
+    enabled: false
+  suspend_reopen:
+    enabled: true
+    reopen_window_ms: 1200
+    ttl_ms: 1500
+    max_clips_per_reopen: 1
+    max_runners: 1
+    reopen_max_bank_pct: 0.002
+    prefer_with_imbalance: true
+    disarm_flap_ms: 4000
+    min_spread_ticks: 1
+    bundle_policy: ALL_OR_CANCEL
+  cross_market:
+    enabled: true
+    freshness_ms: 100
+    cushion_ticks: 2
+    min_dual_best2_sum: 200
+    ttl_ms: 1200
+    top_runners: 3
+    place_terms_k: 3
+    max_spread_ticks: 6
+  identity_book:
+    enabled: true
+  arbiter:
+    allow_opposite_side_stack: true
+    max_per_lane: 1
+    lane_priorities:
+    - suspend_reopen
+    - cross_market
+    - mean_revert
+    - maker
+  maker_thin:
+    enabled: false
+    default_size: 1.0
+    min_spread_ticks: 3
+    thin_best2_depth_sum_max: 200
+    min_lifetime_ms: 2500
+    slippage_cushion_ticks: 2
+    stack:
+      enabled: false
+    hedge:
+      enabled: true
+  parity:
+    bundle_policy: ALL_OR_CANCEL
+trend:
+  thick:
+    slope_window_s: 6
+    burst_window_s: 1.0
+    burst_vs_baseline: 3.0
+    max_adverse_slope: 0.0
+    cooloff_ms: 2000
+    size_scale_live: 0.5
+    extra_min_life_ms_live: 750
+  thin:
+    slope_window_s: 10
+    burst_window_s: 1.0
+    burst_vs_baseline: 3.0
+    max_adverse_slope: 0.0
+    cooloff_ms: 2000
+    size_scale_live: 0.5
+    extra_min_life_ms_live: 1000

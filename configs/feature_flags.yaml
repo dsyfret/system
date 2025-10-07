@@ -1,0 +1,16 @@
+flags:
+  edges:
+    maker: live
+    maker_thick_trend: observer   # shared TrendEngine controls for maker_thick
+    maker_thin: observer          # new thin-maker starts in observer
+    mean_revert: observer         # start observer; promote after checks
+    suspend_reopen: observer      # shipped in observer to avoid accidental live
+    cross_market: observer
+    identity_book: observer       # demoted due to cross-matching compressing intra-book tidy-ups
+    sp_gravity: observer
+    maker_ab: A                   # choose params.A (see edges.maker.params)
+
+ab_tests:
+  mean_revert_band:
+    variantA: {band_ticks_hot: 1.5}
+    variantB: {band_ticks_hot: 1.2}

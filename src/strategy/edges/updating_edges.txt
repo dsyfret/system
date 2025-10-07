@@ -1,0 +1,59 @@
+Here’s the tight map of where edge names/lane IDs are coupled in your stack. If you rename/swap an edge, these are the places to touch.
+
+src/apps/trader.py
+
+Registers concrete edge classes under keys like "maker", "maker_thin", "cross_market/parity", "suspend_reopen".
+
+Reads feature flags by those keys; flips edges to live/observer/off.
+
+Has maker-specific handling (e.g., trend overlay) that detects edge_id containing “maker”. If you add a maker variant, keep “maker” in its edge_id or update the check.
+
+src/strategy/arbiter.py
+
+Lane classifier maps substrings in edge_id → lanes: suspend/reopen → suspend_reopen, cross/parity → cross_market, mean/revert → mean_revert, else → maker.
+
+Default lane priorities (used if YAML doesn’t override). If you introduce a new edge/lane, extend the classifier and/or set priorities in YAML.
+
+configs/feature_flags.yaml
+
+Per-edge switches (booleans or “live/observer”) keyed by edge name; Trader consumes these exact keys.
+
+configs/edges.yaml
+
+Per-edge config blocks keyed by edge name (e.g., edges.maker.*, edges.suspend_reopen.*, edges.cross_market.*).
+
+Arbiter settings here (e.g., lane_priorities, allow_opposite_side_stack, caps) reference lane/edge names.
+
+configs/profiles/*.yaml (e.g., au_racing.yaml, uk_racing.yaml)
+
+disable_edges: [...] lists by edge name for venue/mode-specific hard blocks.
+
+Profile-level overrides under edges.* blocks (fee/slip/cushion etc.) also keyed by edge name.
+
+src/monitoring/dashboards.py
+
+Panels/summary rows labeled per edge (e.g., maker_observer, parity_observer, suspend_reopen_observer). If you rename edges, update labels or keep emitting the old names for continuity.
+
+src/monitoring/alerts.py
+
+A few alerts reference specific edges/lanes (e.g., suspend-too-long cancel, parity freshness checks). Rename/update if you change those edge names.
+
+Edge modules emit edge_id strings
+
+src/strategy/edges/*.py (maker, maker_thin, parity/cross_market, suspend_reopen, mean_revert): proposals include an edge_id. Arbiter’s classifier and Trader’s maker-specific logic rely on that string. Keep it consistent (e.g., include “maker” for maker variants).
+
+Places that are edge-agnostic (no hardwired names)
+
+FeeGate (src/strategy/fee_gate.py), Sizer (src/strategy/sizing.py), Selector admission logic (generic; only reads profile disable_edges), Router/OrderManager/AckTracker, Accounts/Funds, Error ladder. These consume generic proposals/intents and don’t care which edge produced them.
+
+Practical rename/swap checklist
+
+Trader registration + imports (edge key and feature flag name)
+
+Arbiter lane classifier and priorities (or ensure your new edge_id matches existing substring rules)
+
+feature_flags.yaml key, edges.yaml block name, profiles’ disable_edges entries
+
+Dashboard/alert label strings (only if you want bespoke panels; otherwise metrics still flow under generic labels)
+
+Ensure your edge emits an edge_id that classifies as intended (especially for maker variants)
