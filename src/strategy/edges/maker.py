@@ -37,6 +37,8 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                     tick_spacing: 1     # ticks between stacked levels
                     size_mult: 0.6      # multiply size per deeper level
                     min_raw_best2_sum: 300.0  # require sufficient thickness
+                    max_spread_ticks: 6       # NEW: gate stacking if spread too wide
+                    ttl_bump_ms: 0            # NEW: add ttl bump per stacked level
     """
     out: List[Dict[str, Any]] = []
     now_ms = now_ms or int(time.time() * 1000)
@@ -52,6 +54,9 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
     stack_tick_spacing = int(stacking_cfg.get("tick_spacing", 1))
     stack_size_mult = float(stacking_cfg.get("size_mult", 0.6))
     stack_min_raw_best2 = float(stacking_cfg.get("min_raw_best2_sum", 300.0))
+    stack_max_spread = stacking_cfg.get("max_spread_ticks", None)
+    stack_max_spread = int(stack_max_spread) if stack_max_spread is not None else None
+    stack_ttl_bump_ms = int(stacking_cfg.get("ttl_bump_ms", 0))
 
     sel_ids = [selection_id] if selection_id is not None else list(snapshot.runners.keys())
 
@@ -149,8 +154,12 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
 
         # -------------------- Overlay: stacking (optional) -------------------- #
         if stacking_enabled and stack_levels > 0:
-            # require a bit more thickness for stacking
-            if raw_depth_best2 is None or float(raw_depth_best2) < float(stack_min_raw_best2):
+            # Extra gates for stacking:
+            # 1) spread too wide? -> skip stacking
+            if stack_max_spread is not None and sp_ticks > stack_max_spread:
+                pass  # primary quotes still emitted; no stacked levels
+            # 2) require a bit more thickness for stacking
+            elif raw_depth_best2 is None or float(raw_depth_best2) < float(stack_min_raw_best2):
                 pass  # too thin; skip stacking
             else:
                 # Generate deeper levels for each side where we emitted a primary quote
@@ -166,6 +175,7 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                         size = max(0.0, default_size * (stack_size_mult ** lvl))
                         if size <= 0.0:
                             break
+                        ttl_each = ttl_ms + (lvl * max(0, stack_ttl_bump_ms))
                         out.append(EdgeProposal(
                             edge_id=f"maker_{side.lower()}_inside_stack{lvl}",
                             market_id=snapshot.market.market_id,
@@ -173,10 +183,10 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                             side=side,
                             price=float(px),
                             size_hint=float(size),
-                            ttl_ms=ttl_ms,
+                            ttl_ms=int(ttl_each),
                             ev_net_ticks=base_ev_ticks,  # keep conservative
                             weight=weight_base * (0.95 ** lvl),
-                            rationale=_why_maker(f\"{side}_stack{lvl}\", sp_ticks, raw_depth_best2, thin_raw_lay if side==\"BACK\" else thin_raw_back),
+                            rationale=_why_maker(f"{side}_stack{lvl}", sp_ticks, raw_depth_best2, thin_raw_lay if side=="BACK" else thin_raw_back),
                         ))
 
     return out
