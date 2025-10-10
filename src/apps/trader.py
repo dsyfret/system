@@ -109,6 +109,15 @@ class TraderApp:
         self.fee_gate = FeeGate(self.cfg)
         self.sizer = Sizer(self.cfg)
 
+        # Wire exposure resolver so Arbiter can enforce per-runner liability caps
+        try:
+            if hasattr(self.arbiter, "set_exposure_resolver"):
+                self.arbiter.set_exposure_resolver(
+                    lambda mid, sel, side: self.order_manager.exposure_for(mid, sel, side)
+                )
+        except Exception:
+            pass
+   
         # Edges
         self.edges: Dict[str, Any] = {}
         self.trend: Optional[TrendEngine] = None
@@ -696,6 +705,11 @@ async def boot(self) -> None:
                             discovered[mid] = float(ts)  # dict deduplicates across splits
                         except Exception:
                             continue
+        # Discovery heartbeat for staleness alerting
+            try:
+                self.alerts.discovery_heartbeat(time.time())
+            except Exception:
+                pass
 
                     cursor = slice_to
                     await asyncio.sleep(0)
