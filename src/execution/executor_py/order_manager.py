@@ -15,6 +15,10 @@ Purpose  : Place/replace/cancel pacing + LIVE ORDER CACHE (+ mass-cancel helper)
 (ENH 2025-09) Funds-mismatch tripwire support:
              - liability_snapshot() → float  (current internal unmatched liability across live orders)
              - liability_snapshot_by_market() → Dict[str, float]
+
+(ENH 2025-10) Exposure accessors (for Arbiter liability cap integration):
+             - exposure_for(market_id, selection_id, side) → float
+             - exposure_for_runner(market_id, selection_id) → float  (sum of both sides)
 """
 
 from __future__ import annotations
@@ -232,6 +236,49 @@ class OrderManager:
         with contextlib.suppress(Exception):
             metr.set_gauge("internal_unmatched_liability", float(total))
         return float(total)
+
+    # =================== exposure accessors (NEW) =================== #
+    def exposure_for(self, market_id: str, selection_id: int, side: str) -> float:
+        """
+        Return current *unmatched* liability for a specific (market_id, selection_id, side).
+
+        BACK: stake remaining
+        LAY : (price - 1) * stake remaining
+        """
+        try:
+            lo = self.get_live(str(market_id)).get((int(selection_id), str(side).upper()))
+            if not lo:
+                return 0.0
+            rem = max(0.0, float(lo.remaining))
+            if rem <= 1e-12:
+                return 0.0
+            if str(lo.side).upper() == "LAY":
+                return max(0.0, (float(lo.price) - 1.0) * rem)
+            return rem
+        except Exception:
+            return 0.0
+
+    def exposure_for_runner(self, market_id: str, selection_id: int) -> float:
+        """
+        Return current *unmatched* liability for a runner (summing both sides, if any).
+        """
+        try:
+            mp = self.get_live(str(market_id))
+            total = 0.0
+            for side in ("BACK", "LAY"):
+                lo = mp.get((int(selection_id), side))
+                if not lo:
+                    continue
+                rem = max(0.0, float(lo.remaining))
+                if rem <= 1e-12:
+                    continue
+                if side == "LAY":
+                    total += max(0.0, (float(lo.price) - 1.0) * rem)
+                else:
+                    total += rem
+            return float(total)
+        except Exception:
+            return 0.0
 
     # =================== client IO =================== #
     async def _place_via_client(self, qi: QuoteIntent) -> Tuple[str, int, float]:
