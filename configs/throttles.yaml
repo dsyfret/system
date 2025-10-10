@@ -1,6 +1,15 @@
 messages:
   per_market_max_per_sec: 8
   global_max_per_sec: 60
+  # Optional informational message “costing” (ignored if not used by metrics)
+  rate_default: 0.0
+  rate_discounted: 0.0
+  discount_threshold_per_hour: 1000
+
 replaces:
   min_interval_ms: 2000
   widen_trigger_ticks: 1
+
+# Optional (used by OrderManager / Arbiter for pacing & budgets if present)
+min_quote_lifetime_ms: 1500          # hold before replace
+new_risk_budget_abs_per_min: 25.0    # per-market “new risk” budget per minute
