@@ -96,7 +96,7 @@ simulator:
     max_file_mb: 200
     max_files: 10
     normalize_ws: true        # NEW: emit 'delta' lines for each mcm.mc[] item
-    write_raw_ws: true       # NEW: also keep 'type: ws' raw messages (optional)
+    write_raw_ws: true        # NEW: also keep 'type: ws' raw messages (optional)
     delta_file_prefix: wsdelta  # NEW: separate rolling file prefix for delta lines
 discovery:
   refresh_interval_s: 180
@@ -147,6 +147,18 @@ arbiter:
     mean_revert:    mean_revert     # planned, currently off
     bsp_gravity:    cross_market    # future
     xmsr:           xmsr            # future
+    maker_stack:    maker           # NEW: ensure opposite-side helper stays in maker lane
 
   # Lane precedence (highest first). Matches your chosen suite today.
-  lane_priority: [suspend_reopen, maker, cross_market, mean_revert, xmsr] 
+  lane_priority: [suspend_reopen, maker, cross_market, mean_revert, xmsr]
+
+  # NEW: Arbiter unmatched-liability caps (queried via OrderManager.exposure_for*)
+  caps:
+    per_runner_unmatched_liability:
+      enabled: true
+      default: 10.0
+      by_lane:
+        maker:          10.0
+        cross_market:    8.0
+        suspend_reopen:  5.0
+        mean_revert:     6.0
