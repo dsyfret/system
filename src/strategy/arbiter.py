@@ -144,6 +144,23 @@ class Arbiter:
             lane_map = {}
         self._lane_of: Dict[str, str] = lane_map
 
+        # --- Per-runner liability cap (edge-agnostic; optional) ---
+        self._liability_cap_per_runner: Optional[float] = None
+        try:
+            # Prefer canonical knob under risk.*
+            cap = None
+            try:
+                cap = (getattr(snap, "risk", {}) or {}).get("per_runner_liability_cap", None)
+            except Exception:
+                cap = None
+            # Fallback to legacy/maker overlay knob to remain compatible with current YAML
+            if cap is None:
+                cap = (((getattr(snap, "edges", {}) or {}).get("maker", {}) or {})
+                       .get("overlays", {}) or {}).get("stacking", {}).get("liability_cap_per_runner", None)
+            if cap is not None:
+                self._liability_cap_per_runner = float(cap)
+        except Exception:
+            self._liability_cap_per_runner = None
 
         if cfg_override:
             self.persistence = cfg_override.get("persistence", self.persistence)
@@ -159,12 +176,13 @@ class Arbiter:
 
         # State: last decision per (market, selection, side)
         self._last: Dict[Tuple[str, int, str], Dict] = {}
+
     def _classify_lane(self, edge_id: Optional[str]) -> str:
         """Classify edge into lane using config map if provided; fallback to legacy heuristics."""
         try:
             eid = (edge_id or "").lower()
             # exact match on provided name (e.g., "maker", "parity", "suspend_reopen", "xmsr")
-            mapped = self._lane_of.get(eid) if hasattr(self, "_lane_of") and isinstance(self._lane_of, dict) else None
+            mapped = self._lane_of.get(eid) if hasattr(self, "_lane_of") and isinstance(self, Arbiter) and isinstance(self._lane_of, dict) else None
             if mapped:
                 return mapped
         except Exception:
@@ -284,6 +302,25 @@ class Arbiter:
                     for p in same_price_list
                 ]
 
+                # --- Per-runner liability cap (new-intent only; edge-agnostic) ---
+                new_total_size = total_size
+                cap = self._liability_cap_per_runner
+                if cap is not None and cap > 0.0:
+                    liab_per_unit = (max(0.0, target_price - 1.0) if side == "LAY" else 1.0)
+                    if liab_per_unit > 0.0:
+                        allowed_size = max(0.0, float(cap) / liab_per_unit)
+                        if new_total_size > allowed_size:
+                            if allowed_size <= 0.0:
+                                # Nothing allowed under cap → drop this plan
+                                continue
+                            scale = allowed_size / max(1e-12, new_total_size)
+                            for c in contribs:
+                                try:
+                                    c["size"] = float(c.get("size", 0.0)) * scale
+                                except Exception:
+                                    pass
+                            new_total_size = allowed_size
+
                 rationale = (getattr(winner, "rationale", "") or f"{ln} lane").strip()
                 primary_edge = str(getattr(winner, "edge_id", ln)) or ln
 
@@ -292,8 +329,8 @@ class Arbiter:
                     selection_id=sel,
                     side=side,
                     price=target_price,
-                    size=max(0.0, total_size),
-                    size_hint=max(0.0, total_size),
+                    size=max(0.0, new_total_size),
+                    size_hint=max(0.0, new_total_size),
                     min_lifetime_ms=self.min_lifetime_ms,
                     persistence=self.persistence,
                     edge_contribs=contribs,
