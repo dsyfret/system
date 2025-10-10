@@ -69,15 +69,6 @@ edges:
   identity_book:
     enabled: true
 
-  arbiter:
-    allow_opposite_side_stack: true
-    max_per_lane: 1
-    lane_priorities:
-    - suspend_reopen
-    - cross_market
-    - mean_revert
-    - maker
-
   maker_thin:
     enabled: false
     default_size: 1.0
