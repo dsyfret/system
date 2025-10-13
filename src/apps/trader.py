@@ -45,7 +45,6 @@ from ..strategy.edges.mean_revert import MeanRevertEdge
 from ..strategy.edges.suspend_reopen import SuspendReopenEdge
 from ..strategy.edges.parity import ParityEdge
 
-
 from ..strategy.edges.loader import EdgeLoader  # config-driven edge loader
 # Trend overlay
 from ..strategy.trend.engine import TrendEngine
@@ -112,12 +111,16 @@ class TraderApp:
         # Wire exposure resolver so Arbiter can enforce per-runner liability caps
         try:
             if hasattr(self.arbiter, "set_exposure_resolver"):
+                # Prefer OrderManager.exposure_for_runner(...) if available; otherwise fall back to exposure_for(...)
                 self.arbiter.set_exposure_resolver(
-                    lambda mid, sel, side: self.order_manager.exposure_for(mid, sel, side)
+                    (lambda: (getattr(self.order_manager, "exposure_for_runner", None) or getattr(self.order_manager, "exposure_for", None)))
+                    ()  # resolve at runtime
+                    and (lambda mid, sel, side: (getattr(self.order_manager, "exposure_for_runner", None) or getattr(self.order_manager, "exposure_for"))(mid, sel, side))
+                    or (lambda _mid, _sel, _side: 0.0)
                 )
         except Exception:
             pass
-   
+
         # Edges
         self.edges: Dict[str, Any] = {}
         self.trend: Optional[TrendEngine] = None
@@ -369,7 +372,6 @@ async def boot(self) -> None:
         trend_flag   = self._ff_bool(getattr(self.cfg, "feature_flags", {}) or {}, "maker_thick_trend")
         if trend_flag:
             self.trend = TrendEngine(self.cfg)
-
 
 # Market stream
         await self.stream.connect()
@@ -1088,7 +1090,7 @@ async def boot(self) -> None:
                     self.book, self._obs_counts, self.acks, self.order_manager, self._intents_sent_1m
                 )
                 # Update discovery staleness gauge for visibility (alerts use heartbeat internally)
-                try:
+               try:
                     if self._last_discovery_refresh_ts > 0.0:
                         set_gauge("discovery_staleness_s", max(0.0, time.time() - float(self._last_discovery_refresh_ts)))
                 except Exception:
