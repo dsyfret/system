@@ -108,23 +108,6 @@ class TraderApp:
         self.fee_gate = FeeGate(self.cfg)
         self.sizer = Sizer(self.cfg)
 
-        # Wire exposure resolver so Arbiter can enforce per-runner liability caps
-        try:
-            if hasattr(self.arbiter, "set_exposure_resolver"):
-                # Prefer OrderManager.exposure_for_runner(...) if available; otherwise fall back to exposure_for(...)
-                self.arbiter.set_exposure_resolver(
-                    (lambda: (getattr(self.order_manager, "exposure_for_runner", None) or getattr(self.order_manager, "exposure_for", None)))
-                    ()  # resolve at runtime
-                    and (lambda mid, sel, side: (getattr(self.order_manager, "exposure_for_runner", None) or getattr(self.order_manager, "exposure_for"))(mid, sel, side))
-                    or (lambda _mid, _sel, _side: 0.0)
-                )
-        except Exception:
-            pass
-
-        # Edges
-        self.edges: Dict[str, Any] = {}
-        self.trend: Optional[TrendEngine] = None
-
         # Data store & ledger
         self.store = DataStore(self.cfg)
         self.ledger = Ledger(self.cfg)
@@ -155,6 +138,17 @@ class TraderApp:
         self.orders = self._build_orders_client()
         self.order_manager = OrderManager(self.profile, self.ipc, self.orders, self.acks)
         self.router = ExecutorRouter(self.profile, self.ipc, self.order_manager)
+
+        # Wire exposure resolver so Arbiter can enforce per-runner liability caps
+        try:
+            if hasattr(self.arbiter, "set_exposure_resolver"):
+                getter = getattr(self.order_manager, "exposure_for_runner", None) or getattr(self.order_manager, "exposure_for", None)
+                if callable(getter):
+                    self.arbiter.set_exposure_resolver(lambda mid, sel, side: getter(mid, sel, side))
+                else:
+                    self.arbiter.set_exposure_resolver(lambda *_: 0.0)
+        except Exception:
+            pass
 
         # Streams/REST
         self.stream = StreamingClient(self.profile)
@@ -314,8 +308,7 @@ class TraderApp:
             pass
 
     # -------------------- Boot wiring -------------------- #
-    
-async def boot(self) -> None:
+    async def boot(self) -> None:
         log_event("app", "boot", "start", profile=self.profile)
         self.ipc.pause()
 
@@ -373,7 +366,7 @@ async def boot(self) -> None:
         if trend_flag:
             self.trend = TrendEngine(self.cfg)
 
-# Market stream
+        # Market stream
         await self.stream.connect()
         await self.stream.authenticate()
         try:
@@ -707,11 +700,6 @@ async def boot(self) -> None:
                             discovered[mid] = float(ts)  # dict deduplicates across splits
                         except Exception:
                             continue
-        # Discovery heartbeat for staleness alerting
-            try:
-                self.alerts.discovery_heartbeat(time.time())
-            except Exception:
-                pass
 
                     cursor = slice_to
                     await asyncio.sleep(0)
@@ -1046,60 +1034,6 @@ async def boot(self) -> None:
             return float(await get_bankroll(self.profile))
         except Exception:
             return 0.0
-
-    async def _risk_supervisor_loop(self) -> None:
-        while True:
-            try:
-                dec = self.risk.evaluate(
-                    now_ms=_now_ms(),
-                    last_stream_ts_ms=getattr(self.stream, "_last_activity_ms", None),
-                    ack_p95_ms=None,
-                    pnl_today=None,
-                    dd_equity_pct=None,
-                )
-                action = getattr(dec, "action", "OK")
-                if action in ("PAUSE", "FREEZE"):
-                    self.ipc.pause()
-                elif action == "FLATTEN":
-                    self.ipc.pause()
-                    if not self._flatten_issued:
-                        self._flatten_issued = True
-                        ids = list(self._known_market_ids)
-                        for mid in ids:
-                            try:
-                                asyncio.create_task(self.order_manager.cancel_all_in_market(mid, reason="risk_flatten"))
-                            except Exception:
-                                continue
-                else:
-                    if self.ipc.is_paused():
-                        self.ipc.resume()
-                    self._flatten_issued = False
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-
-    async def _emit_dashboard_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(1.0)
-                now_ms = _now_ms()
-                self._prune_intents_window(now_ms)
-                dashboards.emit_summary(
-                    self.book, self._obs_counts, self.acks, self.order_manager, self._intents_sent_1m
-                )
-                # Update discovery staleness gauge for visibility (alerts use heartbeat internally)
-               try:
-                    if self._last_discovery_refresh_ts > 0.0:
-                        set_gauge("discovery_staleness_s", max(0.0, time.time() - float(self._last_discovery_refresh_ts)))
-                except Exception:
-                    pass
-                self.alerts.check(self.health, self.acks, self.order_manager)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log_event("dash", "emit", "error")
 
 
 async def main() -> None:
