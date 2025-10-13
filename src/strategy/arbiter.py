@@ -44,7 +44,7 @@ Notes:
   - Optional resolver hook set via set_exposure_resolver(fn) where
     fn(market_id, selection_id, side) -> current unmatched liability.
   - If a per-runner liability cap is configured, we subtract existing
-    exposure and scale/skip plans accordingly.
+  exposure and scale/skip plans accordingly.
 """
 
 from __future__ import annotations
@@ -152,11 +152,17 @@ class Arbiter:
 
         # --- Exposure-aware per-runner liability cap (optional) ---
         # Primary source: risk.per_runner_liability_cap
-        # Fallback: edges.maker.stack.liability_cap_per_runner (legacy)
+        # Fallbacks: edges.maker.overlays.stacking.liability_cap_per_runner (new)
+        #            edges.maker.stack.liability_cap_per_runner (legacy)
         self._liability_cap_per_runner: Optional[float] = None
         try:
             cap = (getattr(snap, "risk", {}) or {}).get("per_runner_liability_cap", None)
             if cap is None:
+                # NEW canonical path
+                cap = ((((getattr(snap, "edges", {}) or {}).get("maker", {}) or {}).get("overlays", {}) or {})
+                       .get("stacking", {}) or {}).get("liability_cap_per_runner", None)
+            if cap is None:
+                # Legacy path retained
                 cap = ((((getattr(snap, "edges", {}) or {}).get("maker", {}) or {}).get("stack", {}) or {})
                        .get("liability_cap_per_runner", None))
             if cap is not None:
@@ -312,14 +318,30 @@ class Arbiter:
                         remaining_liab = float(cap) - max(0.0, existing)
                         if remaining_liab <= 0.0:
                             # Already at/over cap → skip this plan
+                            log_event(
+                                "arbiter", "arbiter.cap", "skip",
+                                market_id=mid, selection_id=sel, side=side,
+                                cap=cap, existing_liability=existing, price=target_price
+                            )
                             continue
                         allowed_size = remaining_liab / liab_per_unit
                         if new_total_size > allowed_size:
                             if allowed_size <= 0.0:
+                                log_event(
+                                    "arbiter", "arbiter.cap", "skip_zero",
+                                    market_id=mid, selection_id=sel, side=side,
+                                    cap=cap, existing_liability=existing, price=target_price
+                                )
                                 continue
                             scale = allowed_size / max(1e-12, new_total_size)
                             for c in contribs:
                                 c["size"] = float(c.get("size", 0.0)) * scale
+                            log_event(
+                                "arbiter", "arbiter.cap", "trim",
+                                market_id=mid, selection_id=sel, side=side,
+                                cap=cap, existing_liability=existing, allowed_size=allowed_size,
+                                original_size=new_total_size, price=target_price
+                            )
                             new_total_size = allowed_size
 
                 rationale = (getattr(winner, "rationale", "") or f"{ln} lane").strip()
