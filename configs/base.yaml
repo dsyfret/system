@@ -162,3 +162,10 @@ arbiter:
         cross_market:    8.0
         suspend_reopen:  5.0
         mean_revert:     6.0
+
+queue_signals:
+  window_s: 5
+  min_obs_s: 1
+  max_ttf_ms: 15000
+  eps_size: 0.01
+  use_raw: true
