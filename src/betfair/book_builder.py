@@ -19,9 +19,9 @@ import time
 
 from ..core.schemas import (
     Level,
-    RunnerBook,
     MarketState,
     OrderBookSnapshot,
+    RunnerBook,
 )
 from ..betfair.ticks import distance_in_ticks
 
@@ -37,6 +37,15 @@ class BookBuilder:
         self._mbr_source: Dict[str, str] = {}
         self._mbr_updated_ts: Dict[str, int] = {}
 
+        # --- Queue-aware (read-only) signals (EMA-based), per (market, selection) ---
+        self._qa_last_traded_sum: Dict[Tuple[str,int], Tuple[float,int]] = {}
+        self._qa_match_rate_ema: Dict[Tuple[str,int], float] = {}
+        self._qa_last_traded_ts: Dict[Tuple[str,int], int] = {}
+        # Tunables (safe defaults; not required in config)
+        self._qa_window_ms: int = 5000
+        self._qa_eps_size: float = 0.01
+        self._qa_max_ttf_ms: int = 15000
+
     # --------- Public API --------- #
     def reseed_from_snapshot(self, books: List[Dict]) -> int:
         """Merge REST listMarketBook results into current books (idempotent); returns markets reseeded.
@@ -49,106 +58,77 @@ class BookBuilder:
         now_ms = int(time.time() * 1000)
         for b in books:
             try:
-                mid = str(b.get("marketId") or b.get("market_id"))
+                mid = str(b.get("marketId") or b.get("market_id") or "")
                 if not mid:
                     continue
-                # Market-level def
-                md = b.get("marketDefinition") or {}
-                try:
-                    # MBR capture from REST MarketBook.marketDefinition.marketBaseRate
-                    mbr_raw = md.get("marketBaseRate")
-                    if mbr_raw is not None:
+                snap = self._markets.get(mid)
+                if not snap:
+                    snap = OrderBookSnapshot(market=MarketState(market_id=mid))
+                    self._markets[mid] = snap
+
+                # Optional marketDefinition
+                md = b.get("marketDefinition") or b.get("market_def") or {}
+                st = snap.market
+                st.status = md.get("status", st.status)
+                st.in_play = bool(md.get("inPlay", st.in_play))
+                st.bet_delay = md.get("betDelay", st.bet_delay)
+                st.off_dt = md.get("marketTime", st.off_dt)
+                st.suspend_reason = md.get("suspendReason", st.suspend_reason)
+                st.bet_delay_models = md.get("betDelayModels", st.bet_delay_models)
+
+                # MBR if present
+                mbr_raw = md.get("marketBaseRate") or md.get("market_base_rate")
+                if mbr_raw is not None:
+                    try:
                         mbr_pct = float(mbr_raw)
-                        # Betfair often returns percent (e.g., 5.0) -> convert to fraction
                         if mbr_pct > 1.0:
                             mbr_pct = mbr_pct / 100.0
                         self._update_mbr(mid, mbr_pct, source="book")
+                    except Exception:
+                        pass
 
-                    mdef = {
-                        "in_play": bool(md.get("inPlay", md.get("in_play", False))),
-                        "status": md.get("status") or ("OPEN" if not md.get("suspendTime") else None),
-                        "bet_delay": int(md.get("betDelay", md.get("bet_delay", 0) or 0)),
-                        "off_dt": int(md.get("marketTime", md.get("off_dt", 0) or 0)),
-                        "suspend_reason": md.get("suspendReason") or None,
-                    }
-                    self.apply_delta({"market_id": mid, "market_def": mdef})
-                except Exception:
-                    pass
-                # Runner ladders (use REST EX_BEST_OFFERS as both display & raw)
-                for r in b.get("runners", []):
+                # Runners
+                for r in b.get("runners", []) or []:
                     sel = int(r.get("selectionId") or r.get("selection_id") or 0)
                     if not sel:
                         continue
-                    ex = r.get("ex", {}) or {}
-                    backs = ex.get("availableToBack", []) or []
-                    lays = ex.get("availableToLay", []) or []
-                    disp = {
-                        "back": [{"price": float(x.get("price")), "size": float(x.get("size"))} for x in backs[:3]],
-                        "lay":  [{"price": float(x.get("price")), "size": float(x.get("size"))} for x in lays[:3]],
-                    }
-                    raw = disp  # lacking separate RAW from REST; acceptable for reseed
-                    self.apply_delta({
-                        "market_id": mid,
-                        "selection_id": sel,
-                        "img": True,
-                        "display": disp,
-                        "raw": raw,
-                    })
+                    rb = snap.runners.get(sel)
+                    if not rb:
+                        rb = RunnerBook(selection_id=sel)
+                        snap.runners[sel] = rb
+
+                    # DISPLAY virt best
+                    vb = _levels(r.get("ex", {}).get("availableToBack"))
+                    vl = _levels(r.get("ex", {}).get("availableToLay"))
+                    if vb is not None:
+                        rb.best_back_disp = vb
+                        rb.best_back = vb
+                    if vl is not None:
+                        rb.best_lay_disp = vl
+                        rb.best_lay = vl
+
+                    # RAW best (if present in REST seed)
+                    raw_b = _levels(r.get("raw", {}).get("availableToBack"))
+                    raw_l = _levels(r.get("raw", {}).get("availableToLay"))
+                    if raw_b is not None:
+                        rb.best_back_raw = raw_b
+                    if raw_l is not None:
+                        rb.best_lay_raw = raw_l
+
+                    # Traded by price
+                    t = _levels((r.get("ex") or {}).get("tradedVolume"))
+                    if t is not None:
+                        rb.traded_by_price = {lv.price: lv.size for lv in t}
+
+                    rb.raw_depth_best2 = _depth_best2(rb.best_back_raw, rb.best_lay_raw)
+
+                # Freshness markers
                 self._last_reseed_ms[mid] = now_ms
                 self._fresh_levels[mid] = 3
                 count += 1
             except Exception:
                 continue
         return count
-
-    def set_market_metadata(
-        self,
-        market_id: str,
-        suspend_reason=None,
-        bet_delay_models=None,
-        bet_delay=None,
-        bsp_available=None,
-        *,
-        market_base_rate: Optional[float] = None,
-        mbr_source: Optional[str] = None,
-    ) -> None:
-        """
-        Update MarketState metadata fields for a market. Safe if snapshot doesn't exist.
-        Only non-None values are applied.
-        (NEW) Optionally update per-market MBR via market_base_rate (fraction) + mbr_source.
-        """
-        snap = self._markets.get(market_id)
-        if not snap:
-            snap = OrderBookSnapshot(market=MarketState(market_id=market_id))
-            self._markets[market_id] = snap
-
-        if bet_delay is not None:
-            try:
-                snap.market.bet_delay = int(bet_delay)
-            except Exception:
-                pass
-        if suspend_reason is not None:
-            snap.market.suspend_reason = str(suspend_reason)
-        if bet_delay_models is not None:
-            try:
-                snap.market.bet_delay_models = bet_delay_models
-            except Exception:
-                pass
-        if bsp_available is not None:
-            try:
-                snap.market.bsp_available = bool(bsp_available)
-            except Exception:
-                pass
-
-        # NEW: set MBR if provided
-        if market_base_rate is not None:
-            try:
-                mbr_pct = float(market_base_rate)
-                if mbr_pct > 1.0:
-                    mbr_pct = mbr_pct / 100.0
-                self._update_mbr(market_id, mbr_pct, source=str(mbr_source or "catalogue"))
-            except Exception:
-                pass
 
     def apply_delta(self, delta: Dict) -> None:
         mid = delta["market_id"]
@@ -171,17 +151,13 @@ class BookBuilder:
                 except Exception:
                     pass
 
-            snap.market.in_play = bool(md.get("in_play", snap.market.in_play))
-            status = md.get("status")
-            if status:
-                snap.market.status = status
-            if md.get("off_dt") is not None:
-                snap.market.off_dt = int(md["off_dt"])
-            if md.get("bet_delay") is not None:
-                snap.market.bet_delay = int(md["bet_delay"])
-            if md.get("suspend_reason") is not None:
-                snap.market.suspend_reason = md["suspend_reason"]
-            # optional aux fields: bet_delay_models, bsp_available, etc. are set via set_market_metadata
+            st = snap.market
+            st.status = md.get("status", st.status)
+            st.in_play = bool(md.get("in_play", st.in_play))
+            st.bet_delay = md.get("bet_delay", st.bet_delay)
+            st.off_dt = md.get("off_dt", st.off_dt)
+            st.suspend_reason = md.get("suspend_reason", st.suspend_reason)
+            st.bet_delay_models = md.get("bet_delay_models", st.bet_delay_models)
 
         # Runner price/trade updates
         sel = int(delta["selection_id"])
@@ -222,6 +198,28 @@ class BookBuilder:
         traded = _levels(delta.get("traded"))
         if traded is not None:
             rb.traded_by_price = {lv.price: lv.size for lv in traded}
+            # Queue-aware: update traded sum EMA + last traded ts
+            try:
+                key = (mid, sel)
+            except NameError:
+                key = (mid, int(delta.get("selection_id")))
+            try:
+                now_ms = int(time.time() * 1000)
+                total_traded = float(sum(rb.traded_by_price.values()))
+                prev_sum, prev_ts = self._qa_last_traded_sum.get(key, (total_traded, now_ms))
+                delta_sz = max(0.0, total_traded - prev_sum)
+                dt_ms = max(1, now_ms - prev_ts)
+                inst_rate = (delta_sz / (dt_ms / 1000.0)) if dt_ms > 0 else 0.0
+                # EMA with adaptive alpha based on dt and window
+                alpha = 1.0 - (2.718281828459045 ** (-(dt_ms / max(1.0, float(self._qa_window_ms)))))
+                ema_prev = self._qa_match_rate_ema.get(key, 0.0)
+                ema = (alpha * inst_rate) + ((1.0 - alpha) * ema_prev)
+                self._qa_match_rate_ema[key] = float(max(0.0, ema))
+                self._qa_last_traded_sum[key] = (total_traded, now_ms)
+                if delta_sz > 0.0:
+                    self._qa_last_traded_ts[key] = now_ms
+            except Exception:
+                pass
 
         # Derived per-runner
         rb.raw_depth_best2 = _depth_best2(rb.best_back_raw, rb.best_lay_raw)
@@ -232,7 +230,7 @@ class BookBuilder:
         snap.spread_ticks = _spread_ticks(rb.best_back_disp, rb.best_lay_disp)
         snap.spread_ticks_raw = _spread_ticks(rb.best_back_raw, rb.best_lay_raw)
 
-    def snapshot(self, market_id: str) -> Optional[OrderBookSnapshot]:
+    def get_snapshot(self, market_id: str) -> Optional[OrderBookSnapshot]:
         return self._markets.get(market_id)
 
     def all_snapshots(self) -> Dict[str, OrderBookSnapshot]:
@@ -252,6 +250,80 @@ class BookBuilder:
         """
         return self._mbr_pct.get(market_id), self._mbr_source.get(market_id)
 
+    # --------- NEW: Queue-aware read-only helpers --------- #
+
+    def size_ahead_at(self, market_id: str, selection_id: int, side: str, price: float, *, use_raw: bool = True) -> float:
+        """
+        Return the size currently queued ahead of us at `price` on `side`.
+        - If quoting inside the spread (no level at that price), returns 0.0
+        - If price matches the current best price on that side, returns size at that level
+        - Else (deeper or off-level), returns 0.0 conservatively
+        """
+        snap = self._markets.get(str(market_id))
+        if not snap:
+            return 0.0
+        rb = snap.runners.get(int(selection_id))
+        if not rb:
+            return 0.0
+        side = str(side).upper()
+        ladder = (rb.best_back_raw if use_raw else rb.best_back) if side == "BACK" else (rb.best_lay_raw if use_raw else rb.best_lay)
+        if not ladder:
+            return 0.0
+        # exact level match?
+        for lv in ladder:
+            if float(lv.price) == float(price):
+                return float(max(0.0, lv.size))
+        # If we're inside spread (better than current best), there is no queue ahead yet
+        try:
+            best_price = ladder[0].price
+            # BACK inside-spread: price > best_back; LAY inside-spread: price < best_lay
+            if (side == "BACK" and float(price) > float(best_price)) or (side == "LAY" and float(price) < float(best_price)):
+                return 0.0
+        except Exception:
+            pass
+        # Otherwise (off-level), be conservative: 0.0 until we have precise depth at that tick
+        return 0.0
+
+    def match_rate_back_ema(self, market_id: str, selection_id: int) -> float:
+        """EMA of matched size/sec for the runner (used for BACK estimates; symmetric here)."""
+        return float(self._qa_match_rate_ema.get((str(market_id), int(selection_id)), 0.0))
+
+    def match_rate_lay_ema(self, market_id: str, selection_id: int) -> float:
+        """EMA of matched size/sec for the runner (used for LAY estimates; symmetric here)."""
+        return float(self._qa_match_rate_ema.get((str(market_id), int(selection_id)), 0.0))
+
+    def p_fill_at(self, market_id: str, selection_id: int, side: str, price: float, size: float) -> float:
+        """
+        Heuristic probability of fill over the default window based on queue and EMA match rate.
+        Uses a simple exponential decay over expected time-to-fill.
+        """
+        ttf = self.ttf_ms_at(market_id, selection_id, side, price, size)
+        horizon_ms = float(self._qa_window_ms)
+        if ttf <= 0:
+            return 1.0
+        # p ≈ exp(- ttf / horizon)
+        import math as _math
+        p = _math.exp(- float(ttf) / max(1.0, horizon_ms))
+        return float(min(1.0, max(0.0, p)))
+
+    def ttf_ms_at(self, market_id: str, selection_id: int, side: str, price: float, size: float) -> int:
+        """
+        Expected time-to-fill (ms) ≈ (size_ahead + size) / match_rate_ema.
+        Capped to max_ttf_ms; returns max_ttf_ms when insufficient data.
+        """
+        ahead = self.size_ahead_at(market_id, selection_id, side, price)
+        rate = self._qa_match_rate_ema.get((str(market_id), int(selection_id)), 0.0)
+        eps = float(self._qa_eps_size)
+        if rate <= 0.0:
+            return int(self._qa_max_ttf_ms)
+        ttf_s = max(0.0, (ahead + max(0.0, float(size))) / max(eps, float(rate)))
+        ttf_ms = int(min(self._qa_max_ttf_ms, ttf_s * 1000.0))
+        return ttf_ms
+
+    def last_traded_ts_ms(self, market_id: str, selection_id: int) -> Optional[int]:
+        """Timestamp (ms) of the last observed trade for the runner, if any."""
+        return self._qa_last_traded_ts.get((str(market_id), int(selection_id)))
+
 
 # --------- helpers --------- #
 
@@ -268,6 +340,7 @@ def _levels(levels_like) -> Optional[List[Level]]:
         except Exception:
             continue
     return out
+
 
 def _depth_best2(back: List[Level], lay: List[Level]) -> Optional[float]:
     if not back or not lay:
