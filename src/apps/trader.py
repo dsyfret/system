@@ -153,7 +153,8 @@ class TraderApp:
         # Streams/REST
         self.stream = StreamingClient(self.profile)
         self.rest = RestClient(self.profile)
-        self.book = BookBuilder()
+        # (CHANGED) pass queue_signals config into BookBuilder
+        self.book = BookBuilder(queue_cfg=getattr(self.cfg, 'queue_signals', {}) or {})
 
         # (MBR to Sizer logs)
         try:
@@ -171,10 +172,21 @@ class TraderApp:
         self._flatten_issued: bool = False
 
         # ---------- Funds mismatch tripwire state ----------
-        rf = (getattr(self.cfg, "risk", {}) or {}).get("funds", {}) or {}
-        self._funds_mismatch_pct: float = float(rf.get("mismatch_pct", 0.05))     # 5% default
-        self._funds_mismatch_secs: float = float(rf.get("mismatch_secs", 15.0))   # 15s default
-        self._funds_free_buffer_pct: float = float(rf.get("free_buffer_pct", 0.0))
+        rf = (getattr(self.cfg, "metrics", {}) or {}).get("funds", {}) or {}
+        # accept fraction or percent; normalize to fraction internally
+        try:
+            mismatch_pct = rf.get("mismatch_pct", None)
+            if mismatch_pct is None:
+                # fallback to legacy config location under risk.funds if present
+                mismatch_pct = ((getattr(self.cfg, "risk", {}) or {}).get("funds", {}) or {}).get("mismatch_pct", 0.05)
+            self._funds_mismatch_pct: float = float(mismatch_pct if float(mismatch_pct) <= 1.0 else float(mismatch_pct) / 100.0)
+        except Exception:
+            self._funds_mismatch_pct = 0.05
+        try:
+            self._funds_mismatch_secs: float = float(rf.get("mismatch_secs", 15.0))
+        except Exception:
+            self._funds_mismatch_secs = 15.0
+        self._funds_free_buffer_pct: float = float(((getattr(self.cfg, "accounts", {}) or {}).get("funds_buffer_pct", 0.0)) or 0.0)
         self._funds_mismatch_since_ms: Optional[int] = None
 
         # Optional internal-liability resolver
