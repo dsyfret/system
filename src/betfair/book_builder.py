@@ -27,7 +27,7 @@ from ..betfair.ticks import distance_in_ticks
 
 
 class BookBuilder:
-    def __init__(self) -> None:
+    def __init__(self, queue_cfg: dict | None = None) -> None:
         self._markets: Dict[str, OrderBookSnapshot] = {}
         self._last_reseed_ms: Dict[str, int] = {}
         self._fresh_levels: Dict[str, int] = {}
@@ -45,6 +45,38 @@ class BookBuilder:
         self._qa_window_ms: int = 5000
         self._qa_eps_size: float = 0.01
         self._qa_max_ttf_ms: int = 15000
+        # Optional config overrides (queue_signals block from base.yaml)
+        qs = queue_cfg or {}
+        try:
+            w = qs.get("halflife_s")
+            if w is not None:
+                # Convert half-life to approx window_ms: window ≈ halflife / ln(2)
+                self._qa_window_ms = int(max(100, float(w) / 0.69314718056 * 1000.0))
+            else:
+                w2 = qs.get("window_s")
+                if w2 is not None:
+                    self._qa_window_ms = int(max(100, float(w2) * 1000.0))
+        except Exception:
+            pass
+        try:
+            self._qa_eps_size = float(qs.get("eps_size", self._qa_eps_size))
+        except Exception:
+            pass
+        try:
+            self._qa_max_ttf_ms = int(qs.get("max_ttf_ms", self._qa_max_ttf_ms))
+        except Exception:
+            pass
+        try:
+            self._qa_min_obs_ms = int(float(qs.get("min_obs_s", 1.0)) * 1000.0)
+        except Exception:
+            self._qa_min_obs_ms = 1000
+        try:
+            self._qa_use_raw = bool(qs.get("use_raw", True))
+        except Exception:
+            self._qa_use_raw = True
+
+        # First-observation timestamp per runner for min_obs gating
+        self._qa_first_obs_ts: Dict[Tuple[str,int], int] = {}
 
     # --------- Public API --------- #
     def reseed_from_snapshot(self, books: List[Dict]) -> int:
@@ -216,6 +248,8 @@ class BookBuilder:
                 ema = (alpha * inst_rate) + ((1.0 - alpha) * ema_prev)
                 self._qa_match_rate_ema[key] = float(max(0.0, ema))
                 self._qa_last_traded_sum[key] = (total_traded, now_ms)
+                if key not in self._qa_first_obs_ts:
+                    self._qa_first_obs_ts[key] = now_ms
                 if delta_sz > 0.0:
                     self._qa_last_traded_ts[key] = now_ms
             except Exception:
@@ -252,13 +286,15 @@ class BookBuilder:
 
     # --------- NEW: Queue-aware read-only helpers --------- #
 
-    def size_ahead_at(self, market_id: str, selection_id: int, side: str, price: float, *, use_raw: bool = True) -> float:
+    def size_ahead_at(self, market_id: str, selection_id: int, side: str, price: float, *, use_raw: bool | None = None) -> float:
         """
         Return the size currently queued ahead of us at `price` on `side`.
         - If quoting inside the spread (no level at that price), returns 0.0
         - If price matches the current best price on that side, returns size at that level
         - Else (deeper or off-level), returns 0.0 conservatively
         """
+        if use_raw is None:
+            use_raw = getattr(self, '_qa_use_raw', True)
         snap = self._markets.get(str(market_id))
         if not snap:
             return 0.0
@@ -318,6 +354,16 @@ class BookBuilder:
             return int(self._qa_max_ttf_ms)
         ttf_s = max(0.0, (ahead + max(0.0, float(size))) / max(eps, float(rate)))
         ttf_ms = int(min(self._qa_max_ttf_ms, ttf_s * 1000.0))
+        # Enforce a minimum observation warmup to avoid overconfident sub-second TTF
+        try:
+            key = (str(market_id), int(selection_id))
+            first_ts = self._qa_first_obs_ts.get(key)
+            if first_ts is not None:
+                age_ms = max(0, int(time.time() * 1000) - int(first_ts))
+                if age_ms < int(getattr(self, '_qa_min_obs_ms', 1000)):
+                    ttf_ms = max(ttf_ms, int(getattr(self, '_qa_min_obs_ms', 1000)))
+        except Exception:
+            pass
         return ttf_ms
 
     def last_traded_ts_ms(self, market_id: str, selection_id: int) -> Optional[int]:
