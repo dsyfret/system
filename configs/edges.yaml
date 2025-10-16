@@ -24,6 +24,10 @@ edges:
         liability_cap_per_runner: 5.0
         levels: 1            # ≈ max_quotes_per_lane_per_market - 1 (2 → 1)
         tick_spacing: 1
+      queue_aware:
+        enabled: false      # off by default; flip to true when ready
+        min_p_fill: 0.25
+        max_ttf_ms: 8000
     hedge:
       enabled: true
       cushion_ticks: 1
@@ -102,3 +106,4 @@ trend:
     cooloff_ms: 2000
     size_scale_live: 0.5
     extra_min_life_ms_live: 1000
+
