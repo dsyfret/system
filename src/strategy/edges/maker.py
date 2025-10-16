@@ -39,6 +39,10 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                     min_raw_best2_sum: 300.0  # require sufficient thickness
                     max_spread_ticks: 6       # NEW: gate stacking if spread too wide
                     ttl_bump_ms: 0            # NEW: add ttl bump per stacked level
+      - queue_aware.enabled: bool (default False). When True *and* a queue-signals
+        provider is present in cfg["_queue_signals"] (or "queue_signals"), proposals
+        may be dropped when p_fill is too low or TTF too high. Defaults are conservative
+        (no-op if thresholds not provided).
     """
     out: List[Dict[str, Any]] = []
     now_ms = now_ms or int(time.time() * 1000)
@@ -48,6 +52,8 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
 
     # Overlay config (tolerant to older YAMLs)
     overlays = (cfg.get("overlays") or {}) if isinstance(cfg, dict) else {}
+
+    # --- stacking overlay knobs ---
     stacking_cfg = overlays.get("stacking") or {}
     stacking_enabled = bool(stacking_cfg.get("enabled", False))
     stack_levels = int(stacking_cfg.get("levels", 0))
@@ -57,6 +63,14 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
     stack_max_spread = stacking_cfg.get("max_spread_ticks", None)
     stack_max_spread = int(stack_max_spread) if stack_max_spread is not None else None
     stack_ttl_bump_ms = int(stacking_cfg.get("ttl_bump_ms", 0))
+
+    # --- queue-aware overlay knobs (optional) ---
+    qa_cfg = overlays.get("queue_aware") or {}
+    qa_enabled = bool(qa_cfg.get("enabled", False))
+    qa_min_p_fill = float(qa_cfg.get("min_p_fill", 0.0))     # drop if p_fill < this
+    qa_max_ttf_ms = int(qa_cfg.get("max_ttf_ms", 999999))    # drop if ttf_ms > this
+    # find queue-signals provider if present (e.g., BookBuilder)
+    _qs = cfg.get("_queue_signals") or cfg.get("queue_signals")  # optional external
 
     sel_ids = [selection_id] if selection_id is not None else list(snapshot.runners.keys())
 
@@ -117,7 +131,7 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
             target_back = None
         if target_back and target_back < v_lay:
             ev_b = base_ev_ticks + (ev_boost if thin_raw_lay else 0.0)
-            out.append(EdgeProposal(
+            ep_b = EdgeProposal(
                 edge_id="maker_back_inside",
                 market_id=snapshot.market.market_id,
                 selection_id=sel,
@@ -128,8 +142,10 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                 ev_net_ticks=ev_b,
                 weight=weight_base + (0.1 if thin_raw_lay else 0.0),
                 rationale=_why_maker("BACK", sp_ticks, raw_depth_best2, thin_raw_lay),
-            ))
-            primary_prices["BACK"] = float(target_back)
+            )
+            if _queue_keep(ep_b, qa_enabled, _qs, qa_min_p_fill, qa_max_ttf_ms):
+                out.append(ep_b)
+                primary_prices["BACK"] = float(target_back)
 
         # LAY proposal (one tick inside best back)
         try:
@@ -138,7 +154,7 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
             target_lay = None
         if target_lay and target_lay > v_back:
             ev_l = base_ev_ticks + (ev_boost if thin_raw_back else 0.0)
-            out.append(EdgeProposal(
+            ep_l = EdgeProposal(
                 edge_id="maker_lay_inside",
                 market_id=snapshot.market.market_id,
                 selection_id=sel,
@@ -149,8 +165,10 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                 ev_net_ticks=ev_l,
                 weight=weight_base + (0.1 if thin_raw_back else 0.0),
                 rationale=_why_maker("LAY", sp_ticks, raw_depth_best2, thin_raw_back),
-            ))
-            primary_prices["LAY"] = float(target_lay)
+            )
+            if _queue_keep(ep_l, qa_enabled, _qs, qa_min_p_fill, qa_max_ttf_ms):
+                out.append(ep_l)
+                primary_prices["LAY"] = float(target_lay)
 
         # -------------------- Overlay: stacking (optional) -------------------- #
         if stacking_enabled and stack_levels > 0:
@@ -162,7 +180,7 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
             elif raw_depth_best2 is None or float(raw_depth_best2) < float(stack_min_raw_best2):
                 pass  # too thin; skip stacking
             else:
-                # Generate deeper levels for each side where we emitted a primary quote
+                # Generate deeper levels for each side where we (may have) emitted a primary quote
                 for side in ("BACK", "LAY"):
                     base_px = primary_prices.get(side)
                     if base_px is None:
@@ -176,7 +194,7 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                         if size <= 0.0:
                             break
                         ttl_each = ttl_ms + (lvl * max(0, stack_ttl_bump_ms))
-                        out.append(EdgeProposal(
+                        ep_s = EdgeProposal(
                             edge_id=f"maker_{side.lower()}_inside_stack{lvl}",
                             market_id=snapshot.market.market_id,
                             selection_id=sel,
@@ -186,8 +204,15 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
                             ttl_ms=int(ttl_each),
                             ev_net_ticks=base_ev_ticks,  # keep conservative
                             weight=weight_base * (0.95 ** lvl),
-                            rationale=_why_maker(f"{side}_stack{lvl}", sp_ticks, raw_depth_best2, thin_raw_lay if side=="BACK" else thin_raw_back),
-                        ))
+                            rationale=_why_maker(
+                                f"{side}_stack{lvl}",
+                                sp_ticks,
+                                raw_depth_best2,
+                                thin_raw_lay if side == "BACK" else thin_raw_back,
+                            ),
+                        )
+                        if _queue_keep(ep_s, qa_enabled, _qs, qa_min_p_fill, qa_max_ttf_ms):
+                            out.append(ep_s)
 
     return out
 
@@ -238,3 +263,31 @@ def _shift_ticks(px: float, ticks: int, *, side: str) -> Optional[float]:
             return out
     except Exception:
         return None
+
+
+def _queue_keep(ep: Any, qa_enabled: bool, qs: Any, min_p_fill: float, max_ttf_ms: int) -> bool:
+    """
+    Decide whether to keep a proposal based on queue-aware signals.
+    - If overlay disabled or signals missing, always keep (no-op).
+    - Drop if p_fill < min_p_fill or ttf_ms > max_ttf_ms.
+    """
+    if not qa_enabled or qs is None:
+        return True
+    try:
+        mid = getattr(ep, "market_id")
+        sel = int(getattr(ep, "selection_id"))
+        side = str(getattr(ep, "side")).upper()
+        price = float(getattr(ep, "price"))
+        size = float(getattr(ep, "size_hint", 0.0) or 0.0)
+
+        # Compute heuristics via provided queue-signals interface (e.g., BookBuilder)
+        p_fill = float(qs.p_fill_at(mid, sel, side, price, size))
+        if p_fill < float(min_p_fill):
+            return False
+        ttf_ms = int(qs.ttf_ms_at(mid, sel, side, price, size))
+        if ttf_ms > int(max_ttf_ms):
+            return False
+        return True
+    except Exception:
+        # On any failure, be conservative and keep the proposal (overlay is optional)
+        return True
