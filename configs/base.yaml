@@ -117,7 +117,7 @@ edges:
   # 📦 Catalog of planned edges (safe to include even if the module doesn’t exist yet;
   # they won’t be imported unless listed in `enabled`)
   registry:
-    maker:          src.strategy.edges.maker:MakerEdge                 # primary
+    maker:          src.strategy.edges.maker:propose                   # primary; changed to 'propose'; ?other edges should have similar changes
     parity:         src.strategy.edges.parity:ParityEdge               # Parity++ lives here today
     suspend_reopen: src.strategy.edges.suspend_reopen:SuspendReopenEdge
     maker_thin:     src.strategy.edges.maker_thin:MakerThinEdge        # planned OFF
@@ -169,3 +169,4 @@ queue_signals:
   max_ttf_ms: 15000
   eps_size: 0.01
   use_raw: true
+
