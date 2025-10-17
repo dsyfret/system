@@ -39,7 +39,7 @@ from ..strategy.fee_gate import FeeGate
 from ..strategy.sizing import Sizer
 
 # Edges
-from ..strategy.edges.maker import MakerEdge
+# from ..strategy.edges.maker import MakerEdge  --> MakerEdge no longer exists, as I'm now loading maker via EdgeLoader → propose(...)
 from ..strategy.edges.maker_thin import MakerThinEdge
 from ..strategy.edges.mean_revert import MeanRevertEdge
 from ..strategy.edges.suspend_reopen import SuspendReopenEdge
