@@ -330,7 +330,8 @@ class TraderApp:
             edges_cfg = getattr(self.cfg, "edges", {}) or {}
             if isinstance(edges_cfg, dict) and (edges_cfg.get("enabled") or edges_cfg.get("registry")):
                 try:
-                    self.edges = EdgeLoader(self.cfg).load()
+                    # PASS SERVICES HERE (only change in this method)
+                    self.edges = EdgeLoader(self.cfg, services={"book": self.book}).load()
                     used_loader = True
                     log_event("edges", "loader", "loaded", count=len(self.edges))
                 except Exception as e:
