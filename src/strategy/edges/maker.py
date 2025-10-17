@@ -1,4 +1,3 @@
-# src/strategy/edges/maker.py
 """
 Location : src/strategy/edges/maker.py
 Purpose  : Propose inside-spread maker quotes with strict hygiene.
@@ -70,7 +69,11 @@ def propose(snapshot, selection_id: Optional[int], cfg: Dict[str, Any], now_ms: 
     qa_min_p_fill = float(qa_cfg.get("min_p_fill", 0.0))     # drop if p_fill < this
     qa_max_ttf_ms = int(qa_cfg.get("max_ttf_ms", 999999))    # drop if ttf_ms > this
     # find queue-signals provider if present (e.g., BookBuilder)
-    _qs = cfg.get("_queue_signals") or cfg.get("queue_signals")  # optional external
+    _qs = (
+        cfg.get("_queue_signals")
+        or cfg.get("queue_signals")
+        or (cfg.get("_services", {}) or {}).get("book")
+    )  # optional external
 
     sel_ids = [selection_id] if selection_id is not None else list(snapshot.runners.keys())
 
