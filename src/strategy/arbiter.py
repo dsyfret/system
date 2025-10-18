@@ -423,10 +423,8 @@ class Arbiter:
 
                 plans.append(plan)
 
-        plans = self._maybe_add_opposite_stack(plans, snapshots, now)
-
-        if not self.allow_opposite_side_stack:
-            plans = self._collapse_to_single_side(plans)
+        # Opposite-side stacking is an edge-level concern (e.g., Maker overlay).
+        plans = self._collapse_to_single_side(plans)
 
         return plans
 
@@ -469,108 +467,6 @@ class Arbiter:
                     best_side = side
                     keep = pls
             out.extend(keep)
-        return out
-
-    def _maybe_add_opposite_stack(self, plans: List[QuotePlan], snapshots: Any | None, now: int) -> List[QuotePlan]:
-        """For maker lanes in thick books, add a small opposite-side helper plan.
-        Conservative: skip if book thickness cannot be verified from snapshots.
-        """
-        if not (self.allow_opposite_side_stack and getattr(self, "stack_enabled", False)):
-            return plans
-        # Per (market, selection) cap counting
-        per_sel_counts: Dict[Tuple[str,int], int] = {}
-        out: List[QuotePlan] = list(plans)
-        for pl in plans:
-            key = (pl.market_id, pl.selection_id)
-            per_sel_counts[key] = per_sel_counts.get(key, 0) + 1
-
-        def _thick(mid: str, sel: int) -> bool:
-            if snapshots is None:
-                return False
-            try:
-                snap = None
-                # Try common access patterns
-                if hasattr(snapshots, "get"):
-                    snap = snapshots.get(mid)  # type: ignore[attr-defined]
-                if snap is None and hasattr(snapshots, "get_snapshot"):
-                    snap = snapshots.get_snapshot(mid)  # type: ignore[attr-defined]
-                if snap is None and hasattr(snapshots, "all_snapshots"):
-                    snap = (snapshots.all_snapshots() or {}).get(mid)  # type: ignore[attr-defined]
-                if snap is None:
-                    return False
-                rb = getattr(snap, "runners", {}).get(sel)
-                if not rb:
-                    return False
-                backs = getattr(rb, "best_back_raw", None) or getattr(rb, "best_back", []) or []
-                lays  = getattr(rb, "best_lay_raw", None) or getattr(rb, "best_lay", []) or []
-                b2 = sum(float(getattr(x, "size", 0.0) or 0.0) for x in backs[:2])
-                l2 = sum(float(getattr(x, "size", 0.0) or 0.0) for x in lays[:2])
-                raw2 = float(b2 + l2)
-                if raw2 < self.stack_min_raw_best2_sum:
-                    return False
-                # Spread gate
-                try:
-                    bb = float(backs[0].price) if backs else None
-                    bl = float(lays[0].price) if lays else None
-                    if bb is None or bl is None:
-                        return False
-                    sp = distance_in_ticks(bb, bl)
-                    if sp is None or sp <= 0 or sp > self.stack_max_spread_ticks:
-                        return False
-                except Exception:
-                    return False
-                return True
-            except Exception:
-                return False
-
-        for pl in plans:
-            if per_sel_counts.get((pl.market_id, pl.selection_id), 0) >= self.stack_max_quotes_per_lane_per_market:
-                continue
-            # Only for maker lane
-            if getattr(pl, "lane", "maker") != "maker":
-                continue
-            # Verify thickness
-            if not _thick(pl.market_id, pl.selection_id):
-                continue
-            # Build opposite-side plan
-            opp_side = "BACK" if pl.side == "LAY" else "LAY"
-            # Adjust price 1 tick toward getting done
-            price = pl.price
-            try:
-                price = one_tick_down(pl.price) if opp_side == "BACK" else one_tick_up(pl.price)
-                price = float(price or pl.price)
-            except Exception:
-                price = pl.price
-            # Size with caps
-            base = float(getattr(pl, "size", 0.0) or getattr(pl, "size_hint", 0.0) or 0.0)
-            stake = max(0.0, self.stack_size_mult * base)
-            if opp_side == "LAY":
-                liab = stake * max(0.0, (price - 1.0))
-                if liab > self.stack_liability_cap_per_runner and (price - 1.0) > 0:
-                    stake = self.stack_liability_cap_per_runner / (price - 1.0)
-            else:
-                # BACK stake is not liability-limited here; stake is already small
-                pass
-            if stake <= 0.0:
-                continue
-            plan2 = QuotePlan(
-                market_id=pl.market_id,
-                selection_id=pl.selection_id,
-                side=opp_side,
-                price=price,
-                size=stake,
-                size_hint=stake,
-                min_lifetime_ms=int(pl.min_lifetime_ms + self.stack_ttl_bump_ms),
-                persistence=pl.persistence,
-                edge_contribs=[
-                    {"edge_id": "maker_stack", "weight": 0.8, "ev_net_ticks": 0.0, "price": price, "size": stake}
-                ],
-                rationale="maker opposite-side stack",
-                edge_id="maker_stack",
-                lane="maker",
-            )
-            out.append(plan2)
-            per_sel_counts[(pl.market_id, pl.selection_id)] = per_sel_counts.get((pl.market_id, pl.selection_id), 0) + 1
         return out
 
     def _classify_lane(self, edge_id: Optional[str]) -> str:
