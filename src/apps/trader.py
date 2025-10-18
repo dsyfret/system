@@ -999,12 +999,14 @@ class TraderApp:
                     client_ts_ms=_now_ms(),
                 )
 
-                # snap & emit
+                # snap & emit (publish to IPC; router.serve() will process + call our registrar)
                 qi = qi.snapped() if hasattr(qi, "snapped") else qi
                 if not self.ipc.is_paused():
-                    self.router.route(qi)
+                    await self.ipc.publish_intent(qi)
                     self._record_intent_emit(_now_ms())
-                    log_event("hedge", "hedge.emit", "ok", market_id=qi.market_id, selection_id=qi.selection_id, side=qi.side, price=qi.price, size=qi.size, edge=edge_name)
+                    log_event("hedge", "hedge.emit", "ok",
+                              market_id=qi.market_id, selection_id=qi.selection_id,
+                              side=qi.side, price=qi.price, size=qi.size, edge=edge_name)
 
             except asyncio.CancelledError:
                 break
@@ -1028,23 +1030,12 @@ class TraderApp:
                     haircut = float(self.cfg.get('risk', {}).get('bankroll', {}).get('live_haircut_pct', 10))
                     live_bankroll = max(0.0, avail * (1.0 - haircut/100.0))
                     if live_bankroll > 0.0:
-                        return live_bankroll, 'live'
+                        return float(live_bankroll)
             except Exception:
                 pass
         # fixed fallback
         fixed_amt = float(self.cfg.get('risk', {}).get('bankroll', {}).get('fixed_amount', 0.0))
-        return fixed_amt, 'fixed'
-        # P2-8: prefer live availableToBetBalance with haircut when enabled via risk.bankroll.source
-        # Falls back to fixed bankroll when disabled or funds snapshot unavailable.
-        """
-        Fetch bankroll via the configured helper (may be a cached snapshot).
-        We keep this separated to switch to a pure cached path if needed.
-        """
-        from ..strategy.bankroll import get_bankroll
-        try:
-            return float(await get_bankroll(self.profile))
-        except Exception:
-            return 0.0
+        return float(fixed_amt)
 
 
 async def main() -> None:
