@@ -82,6 +82,7 @@ execution:
           BACK: CANCEL_BELOW_MIN
           LAY: CANCEL_BELOW_MIN
 risk:
+  per_runner_liability_cap: 10.0
   new_risk_per_min_abs: 0.0
 accounts:
   poll:
@@ -161,22 +162,12 @@ arbiter:
     min_interval_ms: 2000
     widen_trigger_ticks: 1
 
-  # NEW: Arbiter unmatched-liability caps (queried via OrderManager.exposure_for*)
-  caps:
-    per_runner_unmatched_liability:
-      enabled: true
-      default: 10.0
-      by_lane:
-        maker:          10.0
-        cross_market:    8.0
-        suspend_reopen:  5.0
-        mean_revert:     6.0
-
 queue_signals:
   window_s: 5
   min_obs_s: 1
   max_ttf_ms: 15000
   eps_size: 0.01
   use_raw: true
+
 
 
