@@ -39,11 +39,6 @@ from ..strategy.fee_gate import FeeGate
 from ..strategy.sizing import Sizer
 
 # Edges
-# from ..strategy.edges.maker import MakerEdge  --> MakerEdge no longer exists, as I'm now loading maker via EdgeLoader → propose(...)
-from ..strategy.edges.maker_thin import MakerThinEdge
-from ..strategy.edges.mean_revert import MeanRevertEdge
-from ..strategy.edges.suspend_reopen import SuspendReopenEdge
-from ..strategy.edges.parity import ParityEdge
 
 from ..strategy.edges.loader import EdgeLoader  # config-driven edge loader
 # Trend overlay
@@ -89,12 +84,9 @@ class TraderApp:
 
         # Telemetry windows
         self._intents_sent_1m: deque[int] = deque()
-        self._obs_counts: Dict[str, int] = {
-            "maker_thin": 0,
-            "mean_revert": 0,
-            "suspend_reopen": 0,
-            "parity": 0,
-        }
+
+        # Dynamic edge observer counters (no hardcoded edge names)
+        self._obs_counts: Dict[str, int] = {}
 
         # Health + Alerts
         self.health = Health(self.cfg)
@@ -324,7 +316,7 @@ class TraderApp:
         log_event("app", "boot", "start", profile=self.profile)
         self.ipc.pause()
 
-        # Build edges via config-driven loader when available; otherwise fall back to feature flags
+        # Build edges via config-driven loader (single source of truth)
         used_loader = False
         try:
             edges_cfg = getattr(self.cfg, "edges", {}) or {}
@@ -340,40 +332,7 @@ class TraderApp:
         except Exception:
             self.edges = {}
 
-        if not used_loader:
-            # Back-compat: feature flags path (no behavior change)
-            ff = getattr(self.cfg, "feature_flags", {}) or {}
-            maker_live   = self._ff_bool(ff, "maker", maker_strict=True)
-            maker_thin   = self._ff_bool(ff, "maker_thin")
-            mr           = self._ff_bool(ff, "mean_revert")
-            sr           = self._ff_bool(ff, "suspend_reopen")
-            par          = self._ff_bool(ff, "cross_market")
-
-            if maker_live:
-                try:
-                    self.edges["maker"] = MakerEdge(self.cfg)
-                except Exception:
-                    pass
-            if maker_thin:
-                try:
-                    self.edges["maker_thin"] = MakerThinEdge(self.cfg)
-                except Exception:
-                    pass
-            if mr:
-                try:
-                    self.edges["mean_revert"] = MeanRevertEdge(self.cfg)
-                except Exception:
-                    pass
-            if sr:
-                try:
-                    self.edges["suspend_reopen"] = SuspendReopenEdge(self.cfg)
-                except Exception:
-                    pass
-            if par:
-                try:
-                    self.edges["parity"] = ParityEdge(self.cfg)
-                except Exception:
-                    pass
+        # No feature-flag instantiation fallback: loader is authoritative.
 
         trend_flag   = self._ff_bool(getattr(self.cfg, "feature_flags", {}) or {}, "maker_thick_trend")
         if trend_flag:
