@@ -186,21 +186,10 @@ class Arbiter:
             lane_map = {}
         self._lane_of: Dict[str, str] = lane_map
 
-        # --- Exposure-aware per-runner liability cap (optional) ---
-        # Primary source: risk.per_runner_liability_cap
-        # Fallbacks: edges.maker.overlays.stacking.liability_cap_per_runner (new)
-        #            edges.maker.stack.liability_cap_per_runner (legacy)
+        # --- Exposure-aware per-runner liability cap (optional; single source of truth) ---
         self._liability_cap_per_runner: Optional[float] = None
         try:
             cap = (getattr(snap, "risk", {}) or {}).get("per_runner_liability_cap", None)
-            if cap is None:
-                # NEW canonical path
-                cap = ((((getattr(snap, "edges", {}) or {}).get("maker", {}) or {}).get("overlays", {}) or {})
-                       .get("stacking", {}) or {}).get("liability_cap_per_runner", None)
-            if cap is None:
-                # Legacy path retained
-                cap = ((((getattr(snap, "edges", {}) or {}).get("maker", {}) or {}).get("stack", {}) or {})
-                       .get("liability_cap_per_runner", None))
             if cap is not None:
                 self._liability_cap_per_runner = float(cap)
         except Exception:
