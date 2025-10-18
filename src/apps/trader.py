@@ -191,16 +191,22 @@ class TraderApp:
             internal_liab = None
         self._internal_liability_fn: Optional[Callable[[], float]] = internal_liab
 
-        # ---------- Hedge-on-fill (NEW) ----------
+        # ---------- Hedge-on-fill (edge-agnostic) ----------
+        # Build a per-edge hedge config map from edges.<edge>.hedge
+        self._hedge_cfg_by_edge: Dict[str, Dict[str, Any]] = {}
         try:
-            hed = ((getattr(self.cfg, "edges", {}) or {}).get("maker", {}) or {}).get("hedge", {}) or {}
+            _edges_block = getattr(self.cfg, "edges", {}) or {}
+            for _name, _cfg in _edges_block.items():
+                if _name in ("enabled", "registry"):
+                    continue
+                if isinstance(_cfg, dict):
+                    hed = (_cfg.get("hedge") or {})
+                    if isinstance(hed, dict) and hed.get("enabled", False):
+                        self._hedge_cfg_by_edge[str(_name)] = hed
         except Exception:
-            hed = {}
-        self._hedge_enabled: bool = bool(hed.get("enabled", True))
-        self._hedge_cushion_ticks: int = int(hed.get("cushion_ticks", 1))
-        self._hedge_ttl_ms: int = int(hed.get("ttl_ms", 3000))
-        # maker intent registry: intent_id -> (market_id, selection_id, side)
-        self._maker_intents: Dict[str, Tuple[str, int, str]] = {}
+            self._hedge_cfg_by_edge = {}
+        # intent_id -> (market_id, selection_id, side, edge_name)
+        self._hedge_candidates: Dict[str, Tuple[str, int, str, str]] = {}
 
     # -------------------- Feature flag adapter -------------------- #
     @staticmethod
@@ -413,7 +419,7 @@ class TraderApp:
         self._risk_task = asyncio.create_task(self._risk_supervisor_loop())
 
         # (NEW) Hedge listener
-        if self._hedge_enabled and (self._hedge_task is None or self._hedge_task.done()):
+        if self._hedge_cfg_by_edge and (self._hedge_task is None or self._hedge_task.done()):
             self._hedge_task = asyncio.create_task(self._hedge_on_fill_loop())
 
         log_event("app", "boot", "ok")
@@ -839,32 +845,53 @@ class TraderApp:
             except Exception:
                 log_event("dash", "emit", "error")
 
-    # -------------------- Hedge-on-fill (NEW) -------------------- #
-
-    def _register_maker_intent(self, qi: QuoteIntent) -> None:
-        """Tag maker-originated intents so hedger can react to their fills."""
+    # -------------------- Hedge-on-fill (edge-agnostic) -------------------- #
+    def _register_hedge_candidate(self, qi: QuoteIntent) -> None:
+        """
+        Register an emitted intent for hedge-on-fill IF the originating edge
+        has edges.<edge>.hedge.enabled: true in config.
+        Edge name inferred from the first edge_contribs[*].edge_id (prefix before first "_").
+        """
         try:
-            self._maker_intents[str(qi.intent_id)] = (str(qi.market_id), int(qi.selection_id), str(qi.side).upper())
+            contribs = list(getattr(qi, "edge_contribs", []) or [])
+            if not contribs:
+                return
+            raw_id = str(contribs[0].get("edge_id") or "").strip().lower()
+            if not raw_id:
+                return
+            edge_name = raw_id.split("_", 1)[0]
+            if edge_name not in self._hedge_cfg_by_edge:
+                return
+            self._hedge_candidates[str(qi.intent_id)] = (
+                str(qi.market_id),
+                int(qi.selection_id),
+                str(qi.side).upper(),
+                edge_name,
+            )
         except Exception:
-            pass
+            return
 
     async def _hedge_on_fill_loop(self) -> None:
         """
-        Listen to ExecutionReports; on PARTIAL/FILLED for maker intents, craft a hedge proposal and route it through
+        Listen to ExecutionReports; on PARTIAL/FILLED for eligible intents, craft a hedge proposal and route it through
         FeeGate → Arbiter → Sizer → Router. Prices are snapped before routing.
         """
-        log_event("hedge", "hedge.loop", "start", enabled=self._hedge_enabled)
+        log_event("hedge", "hedge.loop", "start", enabled=bool(self._hedge_cfg_by_edge))
         async for er in self.ipc.iter_reports():
             try:
-                if not self._hedge_enabled:
+                if not self._hedge_cfg_by_edge:
                     continue
                 if er.action not in ("PARTIAL", "FILLED"):
                     continue
-                tup = self._maker_intents.get(str(er.intent_id))
+                tup = self._hedge_candidates.get(str(er.intent_id))
                 if not tup:
-                    continue  # not a maker-intent fill
+                    continue  # not registered for hedge
 
-                mk, sel, orig_side = tup
+                mk, sel, orig_side, edge_name = tup
+                # Per-edge hedge config
+                hed_cfg = self._hedge_cfg_by_edge.get(edge_name) or {}
+                cushion_ticks = int(hed_cfg.get("cushion_ticks", 1))
+                hedge_ttl_ms = int(hed_cfg.get("ttl_ms", 3000))
                 opp_side = "LAY" if str(orig_side).upper() == "BACK" else "BACK"
                 fill_px = float(getattr(er, "fill_price", 0.0) or 0.0)
                 fill_sz = float(getattr(er, "fill_size", 0.0) or 0.0)
@@ -876,14 +903,14 @@ class TraderApp:
                 try:
                     if opp_side == "LAY":
                         # Offer a slightly better lay for takers (nudge downwards)
-                        for _ in range(max(0, self._hedge_cushion_ticks)):
+                        for _ in range(max(0, cushion_ticks)):
                             nxt = one_tick_down(px)
                             if nxt is None:
                                 break
                             px = float(nxt)
                     else:
                         # BACK hedge: nudge upwards
-                        for _ in range(max(0, self._hedge_cushion_ticks)):
+                        for _ in range(max(0, cushion_ticks)):
                             nxt = one_tick_up(px)
                             if nxt is None:
                                 break
@@ -893,11 +920,11 @@ class TraderApp:
 
                 # Build a tiny proposal (goes through FeeGate & Arbiter for hygiene)
                 from ..core.schemas import EdgeProposal  # local import to avoid cycles at module import
-                hedge_ev_ticks = float(self._hedge_cushion_ticks or 1)  # conservative expected net ticks
-                ttl_ms = int(self._hedge_ttl_ms)
+                hedge_ev_ticks = float(cushion_ticks or 1)  # conservative expected net ticks
+                ttl_ms = int(hedge_ttl_ms)
 
                 proposal = EdgeProposal(
-                    edge_id="maker_hedge_on_fill",
+                    edge_id=f"{edge_name}_hedge_on_fill",
                     market_id=str(mk),
                     selection_id=int(sel),
                     side=opp_side,
@@ -906,7 +933,7 @@ class TraderApp:
                     ttl_ms=ttl_ms,
                     weight=1.0,
                     ev_net_ticks=hedge_ev_ticks,
-                    rationale=f"hedge-on-fill {opp_side} (cushion={self._hedge_cushion_ticks})"
+                    rationale=f"hedge-on-fill {opp_side} (edge={edge_name}; cushion={cushion_ticks})"
                 )
 
                 ok, _rsn, _ctx = self.fee_gate.allow(proposal, snapshot=self.book)
@@ -922,7 +949,7 @@ class TraderApp:
                 plan = plans[0]
                 # Sizer expects an EdgeProposal shape; reuse proposal with Arbiter's target price & TTL
                 proposal2 = EdgeProposal(
-                    edge_id="maker_hedge_on_fill",
+                    edge_id=f"{edge_name}_hedge_on_fill",
                     market_id=str(plan.market_id),
                     selection_id=int(plan.selection_id),
                     side=str(plan.side),
@@ -945,7 +972,7 @@ class TraderApp:
                     continue
 
                 qi = QuoteIntent(
-                    intent_id=f"HEDGE:{er.intent_id}:{_now_ms()}",
+                    intent_id=f"HEDGE:{edge_name}:{er.intent_id}:{_now_ms()}",
                     market_id=str(plan.market_id),
                     selection_id=int(plan.selection_id),
                     side=str(plan.side),
@@ -955,8 +982,8 @@ class TraderApp:
                     persistence=str(plan.persistence),
                     min_lifetime_ms=int(plan.min_lifetime_ms),
                     max_replace_rate_per_min=60,
-                    edge_contribs=[{"edge_id": "maker_hedge_on_fill", "weight": 1.0, "ev_net_ticks": hedge_ev_ticks, "price": plan.price, "size": stake}],
-                    risk_tags={"reason": "hedge_on_fill", "parent_intent": er.intent_id},
+                    edge_contribs=[{"edge_id": f"{edge_name}_hedge_on_fill", "weight": 1.0, "ev_net_ticks": hedge_ev_ticks, "price": plan.price, "size": stake}],
+                    risk_tags={"reason": "hedge_on_fill", "parent_intent": er.intent_id, "edge": edge_name},
                     client_ts_ms=_now_ms(),
                 )
 
@@ -965,7 +992,7 @@ class TraderApp:
                 if not self.ipc.is_paused():
                     self.router.route(qi)
                     self._record_intent_emit(_now_ms())
-                    log_event("hedge", "hedge.emit", "ok", market_id=qi.market_id, selection_id=qi.selection_id, side=qi.side, price=qi.price, size=qi.size)
+                    log_event("hedge", "hedge.emit", "ok", market_id=qi.market_id, selection_id=qi.selection_id, side=qi.side, price=qi.price, size=qi.size, edge=edge_name)
 
             except asyncio.CancelledError:
                 break
