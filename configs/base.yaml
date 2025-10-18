@@ -152,6 +152,15 @@ arbiter:
   # Lane precedence (highest first). Matches your chosen suite today.
   lane_priority: [suspend_reopen, maker, cross_market, mean_revert, xmsr]
 
+  # ✅ NEW: Arbiter hygiene (edge-agnostic). These override any legacy Maker values if set.
+  hygiene:
+    min_lifetime_ms: 2000
+
+  # ✅ NEW: Replace pacing (edge-agnostic). Used by Arbiter for price update pacing.
+  replaces:
+    min_interval_ms: 2000
+    widen_trigger_ticks: 1
+
   # NEW: Arbiter unmatched-liability caps (queried via OrderManager.exposure_for*)
   caps:
     per_runner_unmatched_liability:
@@ -169,4 +178,5 @@ queue_signals:
   max_ttf_ms: 15000
   eps_size: 0.01
   use_raw: true
+
 
