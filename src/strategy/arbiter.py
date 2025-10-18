@@ -89,33 +89,69 @@ class Arbiter:
         except Exception:
             pass
 
-        # --- Hygiene knobs ---
+        # --- Hygiene knobs (edge-agnostic) ---
+        # Preferred source: arbiter.* ; Fallbacks: edges.maker.* (legacy) and throttles.replaces.*
         maker_cfg = {}
         try:
             maker_cfg = (getattr(snap, "edges", {}) or {}).get("maker", {})
         except Exception:
-            pass
-        self.min_lifetime_ms: int = int(maker_cfg.get("min_lifetime_ms", 2000))
+            maker_cfg = {}
+
+        arb_top = {}
+        try:
+            arb_top = (getattr(snap, "arbiter", {}) or {})
+        except Exception:
+            arb_top = {}
+
+        hygiene = {}
+        try:
+            hygiene = (arb_top.get("hygiene", {}) or {})
+        except Exception:
+            hygiene = {}
+
+        self.min_lifetime_ms: int = int(
+            hygiene.get("min_lifetime_ms",
+                        maker_cfg.get("min_lifetime_ms", 2000))
+        )
 
         throttles = getattr(snap, "throttles", None)
-        replaces = {}
+        replaces_throttles = {}
         try:
             if throttles:
-                replaces = throttles.get("replaces", {})  # type: ignore[attr-defined]
+                replaces_throttles = throttles.get("replaces", {})  # type: ignore[attr-defined]
         except Exception:
-            replaces = {}
-        self.min_replace_interval_ms: int = int(replaces.get("min_interval_ms", 2000))
-        self.widen_trigger_ticks: int = int(replaces.get("widen_trigger_ticks", 1))
+            replaces_throttles = {}
 
-        # --- Lane / budgets config (all optional; safe defaults) ---
-        arb_cfg = {}
+        replaces_arb = {}
         try:
-            arb_cfg = (getattr(snap, "edges", {}) or {}).get("arbiter", {}) or {}
+            replaces_arb = (arb_top.get("replaces", {}) or {})
         except Exception:
-            arb_cfg = {}
+            replaces_arb = {}
 
-        self.allow_opposite_side_stack: bool = bool(arb_cfg.get("allow_opposite_side_stack", False))
-        self.max_per_lane: int = int(arb_cfg.get("max_per_lane", 1))
+        self.min_replace_interval_ms: int = int(
+            replaces_arb.get("min_interval_ms",
+                             replaces_throttles.get("min_interval_ms", 2000))
+        )
+        self.widen_trigger_ticks: int = int(
+            replaces_arb.get("widen_trigger_ticks",
+                             replaces_throttles.get("widen_trigger_ticks", 1))
+        )
+
+        # --- Lane / budgets config (prefer top-level arbiter.*, fallback to legacy edges.arbiter.*) ---
+        arb_cfg_legacy = {}
+        try:
+            arb_cfg_legacy = (getattr(snap, "edges", {}) or {}).get("arbiter", {}) or {}
+        except Exception:
+            arb_cfg_legacy = {}
+
+        self.allow_opposite_side_stack: bool = bool(
+            arb_top.get("allow_opposite_side_stack",
+                        arb_cfg_legacy.get("allow_opposite_side_stack", False))
+        )
+        self.max_per_lane: int = int(
+            arb_top.get("max_per_lane",
+                        arb_cfg_legacy.get("max_per_lane", 1))
+        )
 
         default_prios = ["suspend_reopen", "cross_market", "mean_revert", "maker"]
         # lane priorities: support top-level `arbiter.lane_priority(s)` first, then legacy `edges.arbiter.lane_priorities`
