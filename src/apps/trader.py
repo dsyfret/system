@@ -129,7 +129,13 @@ class TraderApp:
         self.acks = AckTracker(self.ipc)
         self.orders = self._build_orders_client()
         self.order_manager = OrderManager(self.profile, self.ipc, self.orders, self.acks)
-        self.router = ExecutorRouter(self.profile, self.ipc, self.order_manager)
+        # Router with edge-agnostic callback so we can register hedge candidates
+        self.router = ExecutorRouter(
+            self.profile,
+            self.ipc,
+            self.order_manager,
+            on_intent_published=self._register_hedge_candidate,
+        )
 
         # Wire exposure resolver so Arbiter can enforce per-runner liability caps
         try:
@@ -417,6 +423,12 @@ class TraderApp:
 
         asyncio.create_task(self._emit_dashboard_loop())
         self._risk_task = asyncio.create_task(self._risk_supervisor_loop())
+
+        # Start executor router main loop (consumes intents from IPC)
+        try:
+            asyncio.create_task(self.router.serve())
+        except Exception:
+            pass
 
         # (NEW) Hedge listener
         if self._hedge_cfg_by_edge and (self._hedge_task is None or self._hedge_task.done()):
