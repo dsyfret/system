@@ -9,7 +9,7 @@ Purpose  : Per-market state machine; routes intents; now cancels after long SUSP
                - BEST_EFFORT: tolerate partials (no forced cancels).
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional, Set, List, Tuple
+from typing import Dict, Any, Optional, Set, List, Tuple, Callable
 import time
 import asyncio
 
@@ -24,12 +24,20 @@ from ..policies import should_cancel_after_suspended
 
 
 class ExecutorRouter:
-    def __init__(self, profile_name: str, ipc: IPC, order_manager: OrderManager | None = None) -> None:
+    def __init__(
+        self,
+        profile_name: str,
+        ipc: IPC,
+        order_manager: OrderManager | None = None,
+        on_intent_published: Optional[Callable[[QuoteIntent], None]] = None,
+    ) -> None:
         self.profile = profile_name
         self.ipc = ipc
         self.acks = order_manager.acks if order_manager else AckTracker(ipc)
         self.orders = order_manager.orders if order_manager else OrdersClient(profile_name)
         self.order_manager = order_manager or OrderManager(profile_name, ipc, self.orders, self.acks)
+        # Optional hook (e.g., Trader’s hedge-on-fill registrar)
+        self._on_intent_published = on_intent_published
 
         # market_id -> {status,in_play,bet_delay,suspend_started_ms,canceled_due_to_suspend}
         self._state: Dict[str, Dict[str, Any]] = {}
@@ -74,17 +82,34 @@ class ExecutorRouter:
                 live_id = self.order_manager.find_live_order_id(qi.market_id, qi.selection_id, qi.side)
                 if not live_id:
                     await self.order_manager.place(qi)
+                    # Notify hook after we’ve acted on the intent
+                    if self._on_intent_published is not None:
+                        try:
+                            self._on_intent_published(qi)
+                        except Exception:
+                            pass
+
                 else:
                     # If price differs (beyond fp tolerance), replace; else no-op
                     live = self.order_manager.get_live(qi.market_id).get((qi.selection_id, qi.side))
                     if (not live) or (abs(float(live.price) - float(qi.price)) > 1e-9):
                         await self.order_manager.replace(qi, new_price=qi.price)
+                        if self._on_intent_published is not None:
+                            try:
+                                self._on_intent_published(qi)
+                            except Exception:
+                                pass
                     else:
                         log_event(
                             "exec", "router.noop", "unchanged",
                             market_id=qi.market_id, selection_id=qi.selection_id, side=qi.side, price=qi.price
                         )
-
+                        if self._on_intent_published is not None:
+                            try:
+                                self._on_intent_published(qi)
+                            except Exception:
+                                pass
+                   
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -284,3 +309,4 @@ class ExecutorRouter:
 
     async def cancel(self, qi: QuoteIntent) -> None:
         await self.order_manager.cancel(qi)
+
