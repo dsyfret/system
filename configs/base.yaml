@@ -84,6 +84,8 @@ execution:
 risk:
   per_runner_liability_cap: 10.0
   new_risk_per_min_abs: 0.0
+  size_decision_records:
+    enabled: true          # writes one audit per sized quote
 accounts:
   poll:
     interval_s: 20
@@ -168,6 +170,7 @@ queue_signals:
   max_ttf_ms: 15000
   eps_size: 0.01
   use_raw: true
+
 
 
 
