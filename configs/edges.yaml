@@ -26,12 +26,12 @@ edges:
         tick_spacing: 1
       queue_aware:
         enabled: false      # off by default; flip to true when ready
-        min_p_fill: 0.25
-        max_ttf_ms: 8000
+        min_p_fill: 0.15   # drop quotes with very low fill odds
+        max_ttf_ms: 1500   # drop if time-to-fill too slow
     hedge:
       enabled: true
-      cushion_ticks: 1
-      ttl_ms: 3000
+      cushion_ticks: 1     # nudge toward faster fill
+      ttl_ms: 3000         # short-lived hedge orders
 
   mean_revert:
     enabled: false
@@ -106,4 +106,5 @@ trend:
     cooloff_ms: 2000
     size_scale_live: 0.5
     extra_min_life_ms_live: 1000
+
 
