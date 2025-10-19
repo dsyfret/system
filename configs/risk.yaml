@@ -34,6 +34,8 @@ risk:
     source: fixed
     fixed_amount: 100.0
     live_haircut_pct: 10
+  size_decision_records:
+    enabled: true          # writes one audit per sized quote
   per_runner_liability_cap: 10.0
   size_decision_records:
     enabled: false
@@ -49,4 +51,5 @@ risk:
   odds:
     min: 1.01
     max: 1000.0
+
 
