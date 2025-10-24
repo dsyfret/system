@@ -177,6 +177,10 @@ profile:
     max_edges_per_market: 8
     max_plans_per_loop: 64
 
+    # new (event-driven micro-coalescing / watchdog)
+    debounce_ms: 8      # coalesce tiny WS bursts (~5–10ms typical)
+    watchdog_ms: 100    # wake even if no deltas (best-effort tick)
+    max_batch_ms: 20    # hard cap on coalescing window
 
 
 
