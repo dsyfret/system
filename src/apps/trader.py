@@ -214,6 +214,16 @@ class TraderApp:
         # intent_id -> (market_id, selection_id, side, edge_name)
         self._hedge_candidates: Dict[str, Tuple[str, int, str, str]] = {}
 
+        # ---------- Event-driven loop state (NEW) ----------
+        self._delta_event: asyncio.Event = asyncio.Event()
+        self._dirty_mids: set[str] = set()
+
+        # Loop micro-coalescing / watchdog (configurable)
+        lp = (getattr(self.cfg, "profile", {}) or {}).get("loop", {}) or {}
+        self._debounce_ms: int = int(lp.get("debounce_ms", 8))      # coalesce WS bursts (≈5–10ms)
+        self._watchdog_ms: int = int(lp.get("watchdog_ms", 100))    # tick even when quiet
+        self._max_batch_ms: int = int(lp.get("max_batch_ms", 20))   # hard cap on coalescing
+           
     # -------------------- Feature flag adapter -------------------- #
     @staticmethod
     def _ff_bool(ff: Dict[str, Any], name: str, *, maker_strict: bool = False) -> bool:
@@ -553,6 +563,14 @@ class TraderApp:
                 if msg.get("op") == "mcm":
                     for m in msg.get("mc", []):
                         self.book.apply_delta(m)
+                        # NEW: mark changed market and wake event-driven loop
+                        try:
+                            mid = str(m.get("id") or m.get("marketId") or "")
+                            if mid:
+                                self._dirty_mids.add(mid)
+                                self._delta_event.set()
+                        except Exception:
+                            pass
                 elif msg.get("op") == "connection":
                     log_event("stream", "conn", msg.get("connectionId", ""))
                     await self._seed_after_connect()
@@ -650,23 +668,23 @@ class TraderApp:
             pass
         return intent
 
-    # -------------------- Strategy loop -------------------- #
+    # -------------------- Strategy loop (EVENT-DRIVEN) -------------------- #
     async def run(self) -> None:
         """
-        End-to-end strategy loop:
-          snapshots -> selector.pick_hot -> allocator.allocate
-          -> edges (per hot market) -> FeeGate.filter
-          -> Arbiter.decide -> Sizer.size_plan -> (optional risk admit) -> publish
-        Includes:
+        Event-driven hot loop:
+          - Wake on streaming deltas (via _delta_event), with tiny debounce to coalesce bursts
+          - Prefer markets that actually changed since the last tick
+          - Flow: selector.pick_hot -> edges -> FeeGate -> Arbiter -> Sizer -> publish
+        Retains:
           - Intent rate token-bucket (~per-minute)
-          - Periodic bankroll refresh (for sizer)
+          - Periodic bankroll refresh
           - Optional TrendEngine modifiers
         """
         await self.boot()
 
-        # ---- Loop knobs (configurable with safe defaults) ----
+        # ---- Loop knobs (kept from your old loop; still configurable) ----
         prof = getattr(self.cfg, "profile", {}) or {}
-        loop_sleep_s = float((prof.get("loop") or {}).get("sleep_s", 0.10))  # 100ms
+        loop_sleep_s = float((prof.get("loop") or {}).get("sleep_s", 0.10))  # used only on rare backoff paths
         bankroll_refresh_s = float((prof.get("loop") or {}).get("bankroll_refresh_s", 5.0))
         intents_per_min_cap = int((prof.get("loop") or {}).get("intents_per_min_cap", 600))
         max_edges_per_market = int((prof.get("loop") or {}).get("max_edges_per_market", 8))
@@ -674,7 +692,6 @@ class TraderApp:
 
         last_bankroll_fetch = 0.0
         bankroll = float(await self._cached_bankroll())
-        # Expose source/amount to Sizer.size_plan (it records via internal attrs)
         try:
             setattr(self.sizer, "_bankroll_source", "live_or_fixed")
             setattr(self.sizer, "_bankroll_amount", float(bankroll))
@@ -683,9 +700,20 @@ class TraderApp:
 
         while True:
             try:
+                # Wait for a stream delta OR a watchdog tick
+                try:
+                    await asyncio.wait_for(self._delta_event.wait(), timeout=self._watchdog_ms / 1000.0)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Debounce micro-bursts but never beyond max_batch_ms
+                if self._delta_event.is_set():
+                    await asyncio.sleep(max(0.0, min(self._debounce_ms, self._max_batch_ms) / 1000.0))
+                self._delta_event.clear()
+
                 now_ms = _now_ms()
 
-                # Refresh bankroll on cadence (cheap in your helper)
+                # Periodic bankroll refresh
                 if (time.time() - last_bankroll_fetch) >= bankroll_refresh_s:
                     bankroll = float(await self._cached_bankroll())
                     last_bankroll_fetch = time.time()
@@ -694,45 +722,55 @@ class TraderApp:
                     except Exception:
                         pass
 
-                # Quick rate limiter: cap publishes in the last rolling minute
+                # Rate-limit: cap publishes in last rolling minute
                 self._prune_intents_window(now_ms)
                 if len(self._intents_sent_1m) >= intents_per_min_cap:
+                    # stay event-driven, but nudge scheduler a touch
                     await asyncio.sleep(loop_sleep_s)
                     continue
 
-                # Pick hot markets
-                # Capacity control lives in Allocator; selector handles eligibility & scoring.
-                # We ask selector for up to (allocator.max_hot) directly.
+                # Compute hot set, bias to markets that actually changed
                 try:
                     max_hot = int(getattr(self.allocator, "max_hot", 12))
                 except Exception:
                     max_hot = 12
-                hot_mids = self.selector.pick_hot(self.book, max_hot)
+                hot_mids = self.selector.pick_hot(self.book, max_hot)  # uses your existing selector
+                dirty = list(self._dirty_mids)
+                if dirty:
+                    dirty_set = set(dirty)
+                    targets = [m for m in hot_mids if m in dirty_set] or hot_mids
+                else:
+                    targets = hot_mids
+                self._dirty_mids.clear()
+                if not targets:
+                    continue
 
-                # Collect proposals from edges (per hot market)
-                proposals: List[Any] = []
-                # Robust snapshot iteration
+                # Snapshot map once
                 snapshots = getattr(self.book, "all_snapshots", None)
                 snaps_map = snapshots() if callable(snapshots) else (getattr(self.book, "snapshots", {}) or {})
 
-                for mid in hot_mids:
+                # Collect proposals per target market
+                proposals: List[Any] = []
+                tr = getattr(self, "trend", None)  # trend may not exist
+                for mid in targets:
                     snap = snaps_map.get(mid)
                     if not snap:
                         continue
 
-                    # Trend features once per market (if enabled)
-                    feats = self.trend.features(snap) if self.trend else {}
+                    feats = tr.features(snap) if tr else {}
 
-                    # Edge invocation
+                    # Allow trend to pause maker-style flow defensively (as your old loop)
+                    if tr:
+                        try:
+                            mods = tr.modifiers(feats)
+                            if bool(mods.get("pause", False)):
+                                # (you could allow non-maker lanes here if desired)
+                                continue
+                        except Exception:
+                            pass
+
                     for edge_name, edge_obj in list(getattr(self, "edges", {}) or {}).items()[:max_edges_per_market]:
                         try:
-                            # Allow trend to pause maker-style flow defensively
-                            if self.trend:
-                                mods = self.trend.modifiers(feats)
-                                if bool(mods.get("pause", False)):
-                                    # still allow non-maker lanes if you want; for now pause all edges
-                                    continue
-
                             out = self._call_edge(edge_name, edge_obj, mid, snap, now_ms)
                             if not out:
                                 continue
@@ -741,7 +779,6 @@ class TraderApp:
                                 if self.fee_gate.ok(p, snapshot=self.book):
                                     proposals.append(p)
                                 else:
-                                    # Observer counters by edge name
                                     self._inc_obs(edge_name, 1)
                         except Exception as e:
                             try:
@@ -751,33 +788,30 @@ class TraderApp:
                             continue
 
                 if not proposals:
-                    await asyncio.sleep(loop_sleep_s)
                     continue
 
                 # Arbiter: proposals -> plans
                 plans = self.arbiter.decide(proposals, snapshots=self.book, now_ms=now_ms)
                 if not plans:
-                    await asyncio.sleep(loop_sleep_s)
                     continue
 
-                # Optional cap for safety in one tick
                 if len(plans) > max_plans_per_loop:
                     plans = plans[:max_plans_per_loop]
 
-                # Size plans -> intents and publish
+                # Size & publish
                 published = 0
                 for plan in plans:
-                    # Trend modifiers at plan level (size_mult, extra_min_life_ms)
-                    if self.trend:
+                    # Trend plan-level modifiers
+                    if tr:
                         snap = snaps_map.get(plan.market_id)
-                        feats = self.trend.features(snap) if snap else {}
+                        feats = tr.features(snap) if snap else {}
                         plan = self._apply_trend_to_plan(plan, feats)
 
                     intent = self.sizer.size_plan(plan, bankroll=bankroll, book=self.book)
                     if not intent:
                         continue
 
-                    # Risk per-intent (only if such a gate exists in this branch)
+                    # Optional per-intent risk gate if present
                     try:
                         admit = getattr(self.risk, "admit", None)
                         if callable(admit):
@@ -789,10 +823,9 @@ class TraderApp:
 
                     intent = intent.snapped() if hasattr(intent, "snapped") else intent
 
-                    # Trend annotate for observability
-                    if self.trend:
+                    if tr:
                         snap = snaps_map.get(intent.market_id)
-                        feats = self.trend.features(snap) if snap else {}
+                        feats = tr.features(snap) if snap else {}
                         intent = self._apply_trend_to_intent(intent, feats)
 
                     if not self.ipc.is_paused():
@@ -800,15 +833,12 @@ class TraderApp:
                         self._record_intent_emit(now_ms)
                         published += 1
 
-                        # Hedge registrar now lives in router.on_intent_published,
-                        # but publishing via IPC still triggers router.serve() → callback.
-
-                    # Stop early if we’ve hit the minute cap
                     if len(self._intents_sent_1m) >= intents_per_min_cap:
                         break
 
-                # tiny sleep to keep CPU/scheduler friendly
-                await asyncio.sleep(loop_sleep_s if published == 0 else 0)
+                # If we published nothing (e.g., all blocked), give the loop a tiny breather
+                if published == 0:
+                    await asyncio.sleep(loop_sleep_s)
 
             except asyncio.CancelledError:
                 raise
@@ -817,7 +847,7 @@ class TraderApp:
                     log_event("app", "run.error", type(e).__name__)
                 except Exception:
                     pass
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.010)
            
     # -------------------- Discovery helpers (adaptive split) -------------------- #
 
