@@ -559,6 +559,266 @@ class TraderApp:
             except Exception:
                 log_event("stream", "mcm", "error")
 
+    # -------------------- Edge adapter -------------------- #
+    def _edge_cfg(self, edge_name: str) -> Dict[str, Any]:
+        try:
+            return (getattr(self.cfg, "edges", {}) or {}).get(edge_name, {}) or {}
+        except Exception:
+            return {}
+
+    def _call_edge(
+        self,
+        edge_name: str,
+        edge_obj: Any,
+        market_id: str,
+        snap: Any,
+        now_ms: int,
+    ) -> List[Any]:
+        """
+        Duck-typed adapter: supports a few common shapes so edges can evolve without breaking Trader.
+        Expected return: List[EdgeProposal] (unknown items are ignored upstream).
+        Supported signatures (first that works wins):
+          - edge.propose(book=self.book, market_id=..., snapshot=..., now_ms=..., cfg=...)
+          - edge.proposals(snapshot, market_id, cfg, now_ms=...)
+          - edge.run(snapshot, market_id, cfg, now_ms=...)
+          - edge(book, market_id, snapshot, now_ms=..., cfg=...)
+        """
+        cfg = self._edge_cfg(edge_name)
+        try:
+            # 1) Named kwargs style (preferred)
+            if hasattr(edge_obj, "propose"):
+                return list(edge_obj.propose(book=self.book, market_id=market_id, snapshot=snap, now_ms=now_ms, cfg=cfg) or [])
+        except TypeError:
+            # 2) (snapshot, market_id, cfg, now_ms=...) style
+            try:
+                return list(edge_obj.propose(snap, market_id, cfg, now_ms=now_ms) or [])
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # 3) Alternative method names
+        for meth in ("proposals", "run"):
+            fn = getattr(edge_obj, meth, None)
+            if callable(fn):
+                try:
+                    return list(fn(book=self.book, market_id=market_id, snapshot=snap, now_ms=now_ms, cfg=cfg) or [])
+                except TypeError:
+                    try:
+                        return list(fn(snap, market_id, cfg, now_ms=now_ms) or [])
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        # 4) Callable object fallback
+        try:
+            if callable(edge_obj):
+                try:
+                    return list(edge_obj(self.book, market_id, snap, now_ms=now_ms, cfg=cfg) or [])
+                except TypeError:
+                    return list(edge_obj(snap, market_id, cfg, now_ms=now_ms) or [])
+        except Exception:
+            pass
+        return []
+
+    # -------------------- Trend helpers -------------------- #
+    def _apply_trend_to_plan(self, plan: Any, feats: Dict[str, Any]) -> Any:
+        """Adjust a QuotePlan-like obj with trend modifiers (size_mult, extra_min_life_ms)."""
+        if not self.trend:
+            return plan
+        try:
+            mods = self.trend.modifiers(feats)
+            # pause flag is handled in the main loop (we skip producing intents)
+            size_mult = float(mods.get("size_mult", 1.0) or 1.0)
+            extra_ml = int(mods.get("extra_min_life_ms", 0) or 0)
+
+            if size_mult != 1.0 or extra_ml > 0:
+                # Dataclass-safe: build a shallow clone with tweaks
+                from dataclasses import replace
+                new_size = max(0.0, float(getattr(plan, "size", 0.0)) * size_mult)
+                ml = int(getattr(plan, "min_lifetime_ms", 0)) + extra_ml
+                plan = replace(plan, size=new_size, size_hint=new_size, min_lifetime_ms=ml)
+        except Exception:
+            pass
+        return plan
+
+    def _apply_trend_to_intent(self, intent: Any, feats: Dict[str, Any]) -> Any:
+        """Annotate the QuoteIntent with trend metadata (no size/price changes here)."""
+        try:
+            if self.trend:
+                intent = self.trend.annotate_intent(intent, feats)
+        except Exception:
+            pass
+        return intent
+
+    # -------------------- Strategy loop -------------------- #
+    async def run(self) -> None:
+        """
+        End-to-end strategy loop:
+          snapshots -> selector.pick_hot -> allocator.allocate
+          -> edges (per hot market) -> FeeGate.filter
+          -> Arbiter.decide -> Sizer.size_plan -> (optional risk admit) -> publish
+        Includes:
+          - Intent rate token-bucket (~per-minute)
+          - Periodic bankroll refresh (for sizer)
+          - Optional TrendEngine modifiers
+        """
+        await self.boot()
+
+        # ---- Loop knobs (configurable with safe defaults) ----
+        prof = getattr(self.cfg, "profile", {}) or {}
+        loop_sleep_s = float((prof.get("loop") or {}).get("sleep_s", 0.10))  # 100ms
+        bankroll_refresh_s = float((prof.get("loop") or {}).get("bankroll_refresh_s", 5.0))
+        intents_per_min_cap = int((prof.get("loop") or {}).get("intents_per_min_cap", 600))
+        max_edges_per_market = int((prof.get("loop") or {}).get("max_edges_per_market", 8))
+        max_plans_per_loop = int((prof.get("loop") or {}).get("max_plans_per_loop", 64))
+
+        last_bankroll_fetch = 0.0
+        bankroll = float(await self._cached_bankroll())
+        # Expose source/amount to Sizer.size_plan (it records via internal attrs)
+        try:
+            setattr(self.sizer, "_bankroll_source", "live_or_fixed")
+            setattr(self.sizer, "_bankroll_amount", float(bankroll))
+        except Exception:
+            pass
+
+        while True:
+            try:
+                now_ms = _now_ms()
+
+                # Refresh bankroll on cadence (cheap in your helper)
+                if (time.time() - last_bankroll_fetch) >= bankroll_refresh_s:
+                    bankroll = float(await self._cached_bankroll())
+                    last_bankroll_fetch = time.time()
+                    try:
+                        setattr(self.sizer, "_bankroll_amount", float(bankroll))
+                    except Exception:
+                        pass
+
+                # Quick rate limiter: cap publishes in the last rolling minute
+                self._prune_intents_window(now_ms)
+                if len(self._intents_sent_1m) >= intents_per_min_cap:
+                    await asyncio.sleep(loop_sleep_s)
+                    continue
+
+                # Pick hot markets
+                # Capacity control lives in Allocator; selector handles eligibility & scoring.
+                # We ask selector for up to (allocator.max_hot) directly.
+                try:
+                    max_hot = int(getattr(self.allocator, "max_hot", 12))
+                except Exception:
+                    max_hot = 12
+                hot_mids = self.selector.pick_hot(self.book, max_hot)
+
+                # Collect proposals from edges (per hot market)
+                proposals: List[Any] = []
+                # Robust snapshot iteration
+                snapshots = getattr(self.book, "all_snapshots", None)
+                snaps_map = snapshots() if callable(snapshots) else (getattr(self.book, "snapshots", {}) or {})
+
+                for mid in hot_mids:
+                    snap = snaps_map.get(mid)
+                    if not snap:
+                        continue
+
+                    # Trend features once per market (if enabled)
+                    feats = self.trend.features(snap) if self.trend else {}
+
+                    # Edge invocation
+                    for edge_name, edge_obj in list(getattr(self, "edges", {}) or {}).items()[:max_edges_per_market]:
+                        try:
+                            # Allow trend to pause maker-style flow defensively
+                            if self.trend:
+                                mods = self.trend.modifiers(feats)
+                                if bool(mods.get("pause", False)):
+                                    # still allow non-maker lanes if you want; for now pause all edges
+                                    continue
+
+                            out = self._call_edge(edge_name, edge_obj, mid, snap, now_ms)
+                            if not out:
+                                continue
+                            for p in out:
+                                # Fee-gate each proposal immediately (logs per item)
+                                if self.fee_gate.ok(p, snapshot=self.book):
+                                    proposals.append(p)
+                                else:
+                                    # Observer counters by edge name
+                                    self._inc_obs(edge_name, 1)
+                        except Exception as e:
+                            try:
+                                log_event("edge", "edge.error", type(e).__name__, edge=edge_name)
+                            except Exception:
+                                pass
+                            continue
+
+                if not proposals:
+                    await asyncio.sleep(loop_sleep_s)
+                    continue
+
+                # Arbiter: proposals -> plans
+                plans = self.arbiter.decide(proposals, snapshots=self.book, now_ms=now_ms)
+                if not plans:
+                    await asyncio.sleep(loop_sleep_s)
+                    continue
+
+                # Optional cap for safety in one tick
+                if len(plans) > max_plans_per_loop:
+                    plans = plans[:max_plans_per_loop]
+
+                # Size plans -> intents and publish
+                published = 0
+                for plan in plans:
+                    # Trend modifiers at plan level (size_mult, extra_min_life_ms)
+                    if self.trend:
+                        snap = snaps_map.get(plan.market_id)
+                        feats = self.trend.features(snap) if snap else {}
+                        plan = self._apply_trend_to_plan(plan, feats)
+
+                    intent = self.sizer.size_plan(plan, bankroll=bankroll, book=self.book)
+                    if not intent:
+                        continue
+
+                    # Risk per-intent (only if such a gate exists in this branch)
+                    try:
+                        admit = getattr(self.risk, "admit", None)
+                        if callable(admit):
+                            ok, _ = admit(intent, self.book)
+                            if not ok:
+                                continue
+                    except Exception:
+                        pass
+
+                    intent = intent.snapped() if hasattr(intent, "snapped") else intent
+
+                    # Trend annotate for observability
+                    if self.trend:
+                        snap = snaps_map.get(intent.market_id)
+                        feats = self.trend.features(snap) if snap else {}
+                        intent = self._apply_trend_to_intent(intent, feats)
+
+                    if not self.ipc.is_paused():
+                        await self.ipc.publish_intent(intent)
+                        self._record_intent_emit(now_ms)
+                        published += 1
+
+                        # Hedge registrar now lives in router.on_intent_published,
+                        # but publishing via IPC still triggers router.serve() → callback.
+
+                    # Stop early if we’ve hit the minute cap
+                    if len(self._intents_sent_1m) >= intents_per_min_cap:
+                        break
+
+                # tiny sleep to keep CPU/scheduler friendly
+                await asyncio.sleep(loop_sleep_s if published == 0 else 0)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                try:
+                    log_event("app", "run.error", type(e).__name__)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+           
     # -------------------- Discovery helpers (adaptive split) -------------------- #
 
     async def _fetch_catalogue_window(
