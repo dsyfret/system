@@ -40,7 +40,8 @@ from ..strategy.sizing import Sizer
 
 # Edges
 
-from ..strategy.edges.loader import EdgeLoader  # config-driven edge loader
+from ..strategy.edges.loader import EdgeLoader  # ctx-only edge loader
+from ..strategy.context import StrategyContext
 # Trend overlay
 from ..strategy.trend.engine import TrendEngine
 
@@ -344,8 +345,7 @@ class TraderApp:
             edges_cfg = getattr(self.cfg, "edges", {}) or {}
             if isinstance(edges_cfg, dict) and (edges_cfg.get("enabled") or edges_cfg.get("registry")):
                 try:
-                    # PASS SERVICES HERE (only change in this method)
-                    self.edges = EdgeLoader(self.cfg, services={"book": self.book}).load()
+                    self.edges = EdgeLoader(self.cfg).load()
                     used_loader = True
                     log_event("edges", "loader", "loaded", count=len(self.edges))
                 except Exception as e:
@@ -577,67 +577,6 @@ class TraderApp:
             except Exception:
                 log_event("stream", "mcm", "error")
 
-    # -------------------- Edge adapter -------------------- #
-    def _edge_cfg(self, edge_name: str) -> Dict[str, Any]:
-        try:
-            return (getattr(self.cfg, "edges", {}) or {}).get(edge_name, {}) or {}
-        except Exception:
-            return {}
-
-    def _call_edge(
-        self,
-        edge_name: str,
-        edge_obj: Any,
-        market_id: str,
-        snap: Any,
-        now_ms: int,
-    ) -> List[Any]:
-        """
-        Duck-typed adapter: supports a few common shapes so edges can evolve without breaking Trader.
-        Expected return: List[EdgeProposal] (unknown items are ignored upstream).
-        Supported signatures (first that works wins):
-          - edge.propose(book=self.book, market_id=..., snapshot=..., now_ms=..., cfg=...)
-          - edge.proposals(snapshot, market_id, cfg, now_ms=...)
-          - edge.run(snapshot, market_id, cfg, now_ms=...)
-          - edge(book, market_id, snapshot, now_ms=..., cfg=...)
-        """
-        cfg = self._edge_cfg(edge_name)
-        try:
-            # 1) Named kwargs style (preferred)
-            if hasattr(edge_obj, "propose"):
-                return list(edge_obj.propose(book=self.book, market_id=market_id, snapshot=snap, now_ms=now_ms, cfg=cfg) or [])
-        except TypeError:
-            # 2) (snapshot, market_id, cfg, now_ms=...) style
-            try:
-                return list(edge_obj.propose(snap, market_id, cfg, now_ms=now_ms) or [])
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # 3) Alternative method names
-        for meth in ("proposals", "run"):
-            fn = getattr(edge_obj, meth, None)
-            if callable(fn):
-                try:
-                    return list(fn(book=self.book, market_id=market_id, snapshot=snap, now_ms=now_ms, cfg=cfg) or [])
-                except TypeError:
-                    try:
-                        return list(fn(snap, market_id, cfg, now_ms=now_ms) or [])
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-        # 4) Callable object fallback
-        try:
-            if callable(edge_obj):
-                try:
-                    return list(edge_obj(self.book, market_id, snap, now_ms=now_ms, cfg=cfg) or [])
-                except TypeError:
-                    return list(edge_obj(snap, market_id, cfg, now_ms=now_ms) or [])
-        except Exception:
-            pass
-        return []
-
     # -------------------- Trend helpers -------------------- #
     def _apply_trend_to_plan(self, plan: Any, feats: Dict[str, Any]) -> Any:
         """Adjust a QuotePlan-like obj with trend modifiers (size_mult, extra_min_life_ms)."""
@@ -769,13 +708,21 @@ class TraderApp:
                         except Exception:
                             pass
 
-                    for edge_name, edge_obj in list(getattr(self, "edges", {}) or {}).items()[:max_edges_per_market]:
+                    for edge_name, edge_callable in list(getattr(self, "edges", {}) or {}).items()[:max_edges_per_market]:
                         try:
-                            out = self._call_edge(edge_name, edge_obj, mid, snap, now_ms)
+                            ctx = StrategyContext(
+                                market_id=mid,
+                                selection_id=None,  # edge may iterate runners
+                                snapshot=snap,
+                                cfg=(getattr(self.cfg, "edges", {}) or {}).get(edge_name, {}) or {},
+                                book=self.book,
+                                now_ms=now_ms,
+                                edge_id=edge_name,
+                            )
+                            out = edge_callable(ctx) or []
                             if not out:
                                 continue
                             for p in out:
-                                # Fee-gate each proposal immediately (logs per item)
                                 if self.fee_gate.ok(p, snapshot=self.book):
                                     proposals.append(p)
                                 else:
