@@ -1,10 +1,14 @@
 """
-EdgeLoader: config-driven edge registry/constructor.
+EdgeLoader: config-driven edge registry/constructor (ctx-only).
 
 - Reads edges.enabled (list[str]) and edges.registry[edge_name] = "module:Symbol".
-- Supports both classes (instantiated with cfg) and callables (functions) as edge providers.
-- Back-compat: if registry missing a key, attempts sensible defaults by edge name *only when called explicitly*.
-  (Trader falls back to legacy feature flags when no edges.enabled/registry present.)
+- Returns a dict[str, Callable[[StrategyContext], Any]].
+- No legacy cfg mutation or hidden injections.
+
+Providers must expose one of:
+  - def run(ctx: StrategyContext) -> Any
+  - class with __call__(self, ctx: StrategyContext) -> Any
+  - class with run(self, ctx: StrategyContext) -> Any
 """
 
 from __future__ import annotations
@@ -12,84 +16,66 @@ from typing import Any, Dict, Callable
 import importlib
 import inspect
 
-class EdgeLoader:
-    def __init__(self, cfg: Any, services: Dict[str, Any] | None = None) -> None:
-        self.cfg = cfg
-        self.services = services or {}
+from ..context import StrategyContext
 
-    def _resolve(self, target: str):
-        """
-        Import and return attribute referred to by 'module:attr'.
-        """
+class EdgeLoader:
+    def __init__(self, cfg: Any) -> None:
+        self.cfg = cfg
+
+    def _resolve(self, target: str) -> Any:
         if ":" not in target:
             raise ValueError(f"Invalid edge target (expected 'module:attr'): {target}")
         mod_name, attr = target.split(":", 1)
         mod = importlib.import_module(mod_name)
         return getattr(mod, attr)
 
-    def _wrap_callable_with_services(self, fn: Callable[[Any, Any, Dict[str, Any], Any], Any]) -> Callable[..., Any]:
-        """
-        Wrap an edge callable so that its cfg receives injected services.
-        Expected callable signature: (snapshot, selection_id, cfg, now_ms=None) or similar.
-        """
-        def _call_with_services(*args, **kwargs):
-            # Find cfg arg by position (3rd) or name ('cfg')
-            cfg = None
-            new_args = list(args)
-            sig = None
+    def _to_ctx_callable(self, obj: Any, name: str) -> Callable[[StrategyContext], Any]:
+        # Plain callable (function or functor)
+        if callable(obj) and not isinstance(obj, type):
             try:
-                sig = inspect.signature(fn)
+                sig = inspect.signature(obj)
+                if len(sig.parameters) == 1:
+                    return obj  # type: ignore[return-value]
             except Exception:
-                sig = None
+                pass
+            return obj  # assume __call__(ctx) compatible
 
-            if len(new_args) >= 3:
-                cfg = new_args[2]
-            else:
-                cfg = kwargs.get("cfg")
+        # Class → instantiate, then prefer __call__ or run
+        if isinstance(obj, type):
+            try:
+                inst = obj()
+            except TypeError:
+                try:
+                    inst = obj(self.cfg)
+                except Exception as e:
+                    raise TypeError(f"Edge '{name}' class could not be instantiated without legacy args: {e}") from e
 
-            # Merge services into cfg under _services; also provide _queue_signals convenience if 'book' exists
-            cfg_dict = dict(cfg or {})
-            # Non-destructive merge of _services
-            existing_services = dict(cfg_dict.get("_services") or {})
-            merged_services = {**existing_services, **(self.services or {})}
-            cfg_dict["_services"] = merged_services
-            if "book" in merged_services and "_queue_signals" not in cfg_dict:
-                cfg_dict["_queue_signals"] = merged_services["book"]
+            if callable(inst):
+                return inst  # type: ignore[return-value]
 
-            # Write back into positional or kwarg
-            if len(new_args) >= 3:
-                new_args[2] = cfg_dict
-            else:
-                kwargs["cfg"] = cfg_dict
+            run = getattr(inst, "run", None)
+            if callable(run):
+                def _call(ctx: StrategyContext):
+                    return run(ctx)
+                return _call
 
-            return fn(*new_args, **kwargs)
-        return _call_with_services
+        raise TypeError(
+            f"Edge '{name}' must expose ctx-only callable: function run(ctx) or class with __call__(ctx)/run(ctx)"
+        )
 
-    def load(self) -> Dict[str, Any]:
+    def load(self) -> Dict[str, Callable[[StrategyContext], Any]]:
         edges_cfg = getattr(self.cfg, "edges", {}) or {}
         enabled = list(edges_cfg.get("enabled") or [])
         registry = dict(edges_cfg.get("registry") or {})
-        result: Dict[str, Any] = {}
+        result: Dict[str, Callable[[StrategyContext], Any]] = {}
 
         for name in enabled:
             target = registry.get(name)
             if not target:
-                # No guessing here; Trader will fall back to legacy feature flags.
                 continue
             obj = self._resolve(target)
-            # If it's a class, instantiate with cfg; if it's a function/callable, keep as-is (but wrap to inject services).
             try:
-                if isinstance(obj, type):
-                    try:
-                        inst = obj(self.cfg)
-                    except TypeError:
-                        inst = obj()
-                    result[name] = inst
-                else:
-                    # callable/function edge — wrap to inject services into cfg at call time
-                    wrapped = self._wrap_callable_with_services(obj)
-                    result[name] = wrapped
+                result[name] = self._to_ctx_callable(obj, name)
             except Exception:
-                # Skip edge if it fails to construct
                 continue
         return result
