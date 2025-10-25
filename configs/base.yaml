@@ -64,9 +64,6 @@ metrics:
   messages_per_gbp_warn: 80
   replace_place_warn: 2.5
   funds:
-    # Use one scale; both are accepted by alerts:
-    # - fraction: 0.05  (== 5%)
-    # - percent : 5.0   (== 5%)
     mismatch_pct: 5.0
     mismatch_secs: 30.0
 execution:
@@ -96,68 +93,140 @@ simulator:
     snap_interval_s: 10
     max_file_mb: 200
     max_files: 10
-    normalize_ws: true        # NEW: emit 'delta' lines for each mcm.mc[] item
-    write_raw_ws: true        # NEW: also keep 'type: ws' raw messages (optional)
-    delta_file_prefix: wsdelta  # NEW: separate rolling file prefix for delta lines
+    normalize_ws: true
+    write_raw_ws: true
+    delta_file_prefix: wsdelta
 discovery:
   refresh_interval_s: 180
   horizon_hours: 24
   slice_hours: 3
   min_slice_seconds: 300
-  grace_post_off_s: 1200     # 20 minutes after off
-  max_staleness_s: 900       # alert if no refresh > 15m
+  grace_post_off_s: 1200
+  max_staleness_s: 900
   unsubscribe_enabled: true
-  event_type_ids: [7]          # 7 = Horse Racing; add others to include sports; [] is all events (including sports)
-  market_types: [WIN, PLACE]   # extend as needed (e.g., MATCH_ODDS, OVER_UNDER_25, etc.); [] is all market types for the selected event types
-  country_codes: []            # [] = all countries; set to [GB, IE] for London focus
+  event_type_ids: [7]
+  market_types: [WIN, PLACE]
+  country_codes: []
   max_results: 1000
 edges:
-  # 🔌 What’s actually ON right now (order = precedence we’ll use in Step 2)
-  enabled: [suspend_reopen, maker, parity]
+  # ctx-only migration: keep enabled set minimal until other edges are ported
+  enabled: [maker]
 
-  # 📦 Catalog of planned edges (safe to include even if the module doesn’t exist yet;
-  # they won’t be imported unless listed in `enabled`)
   registry:
-    maker:          src.strategy.edges.maker:propose                   # primary; changed to 'propose'; ?other edges should have similar changes
-    parity:         src.strategy.edges.parity:ParityEdge               # Parity++ lives here today
+    # Maker now exposes ctx entrypoint `run`
+    maker:          src.strategy.edges.maker:run
+    # The rest remain registered (not enabled) until ported to ctx-mode:
+    parity:         src.strategy.edges.parity:ParityEdge
     suspend_reopen: src.strategy.edges.suspend_reopen:SuspendReopenEdge
-    maker_thin:     src.strategy.edges.maker_thin:MakerThinEdge        # planned OFF
-    mean_revert:    src.strategy.edges.mean_revert:MeanRevertEdge      # planned OFF
-    bsp_gravity:    src.strategy.edges.bsp_gravity:BspGravityEdge      # future, OFF
-    xmsr:           src.strategy.edges.xmsr:XMSREdge                   # future, OFF
+    maker_thin:     src.strategy.edges.maker_thin:MakerThinEdge
+    mean_revert:    src.strategy.edges.mean_revert:MeanRevertEdge
+    bsp_gravity:    src.strategy.edges.bsp_gravity:BspGravityEdge
+    xmsr:           src.strategy.edges.xmsr:XMSREdge
 
-  # Maker overlays: all OFF so you can validate clean Maker first
+  # Maker edge config – your existing knobs preserved
   maker:
+    enabled: true
+    default_size: 2.0
+    min_spread_ticks: 2
+    min_depth_best2: 200
+    min_lifetime_ms: 2000
+    ev_assume_ticks: 0.8
+    ev_divergence_boost: 0.2
+    fallback_mode: observer
+    fallback_size_mult: 0.5
+    params:
+      A:
+        fallback_mode: false
+      B:
+        fallback_mode: live
     overlays:
-      dwell_bias:    false
-      sweep_sniffer: false
-      cadence:       false
-      trend_nudge:   false
-      stacking:      false
+      stacking:
+        enabled: true
+        min_raw_best2_sum: 400
+        max_spread_ticks: 6
+        size_mult: 0.3
+        ttl_bump_ms: 400
+        liability_cap_per_runner: 5.0
+        levels: 1
+        tick_spacing: 1
+      queue_aware:
+        enabled: false
+        min_p_fill: 0.15
+        max_ttf_ms: 1500
     hedge:
       enabled: true
       cushion_ticks: 1
       ttl_ms: 3000
+
+  mean_revert:
+    enabled: false
+    default_size: 1.0
+    ttl_ms: 1500
+    band_ticks_min: 1.0
+    band_ticks_max: 1.5
+    max_spread_ticks: 6
+    min_raw_best2_sum: 250
+    slope_suppress_abs: 0.8
+    max_candidates: 2
+    bundle_policy: BEST_EFFORT
+
+  sp_gravity:
+    enabled: false
+
+  suspend_reopen:
+    enabled: false  # disabled until ported to ctx-mode
+    reopen_window_ms: 1200
+    ttl_ms: 1500
+    max_clips_per_reopen: 1
+    max_runners: 1
+    reopen_max_bank_pct: 0.002
+    prefer_with_imbalance: true
+    disarm_flap_ms: 4000
+    min_spread_ticks: 1
+    bundle_policy: ALL_OR_CANCEL
+
+  cross_market:
+    enabled: false  # disabled until ported to ctx-mode
+    freshness_ms: 100
+    cushion_ticks: 2
+    min_dual_best2_sum: 200
+    ttl_ms: 1200
+    top_runners: 3
+    place_terms_k: 3
+    max_spread_ticks: 6
+
+  identity_book:
+    enabled: false
+
+  maker_thin:
+    enabled: false
+    default_size: 1.0
+    min_spread_ticks: 3
+    thin_best2_depth_sum_max: 200
+    min_lifetime_ms: 2500
+    slippage_cushion_ticks: 2
+    overlays:
+      stacking:
+        enabled: false
+    hedge:
+      enabled: true
+
+  parity:
+    bundle_policy: ALL_OR_CANCEL
+
 arbiter:
-  # Map edge names → lanes (exact match; lowercased internally)
   lane_of:
     suspend_reopen: suspend_reopen
     maker:          maker
     parity:         cross_market
-    maker_thin:     maker           # planned, currently off
-    mean_revert:    mean_revert     # planned, currently off
-    bsp_gravity:    cross_market    # future
-    xmsr:           xmsr            # future
-    maker_stack:    maker           # NEW: ensure opposite-side helper stays in maker lane
-
-  # Lane precedence (highest first). Matches your chosen suite today.
+    maker_thin:     maker
+    mean_revert:    mean_revert
+    bsp_gravity:    cross_market
+    xmsr:           xmsr
+    maker_stack:    maker
   lane_priority: [suspend_reopen, maker, cross_market, mean_revert, xmsr]
-
-  # ✅ NEW: Arbiter hygiene (edge-agnostic). These override any legacy Maker values if set.
   hygiene:
     min_lifetime_ms: 2000
-
-  # ✅ NEW: Replace pacing (edge-agnostic). Used by Arbiter for price update pacing.
   replaces:
     min_interval_ms: 2000
     widen_trigger_ticks: 1
@@ -173,16 +242,9 @@ profile:
   loop:
     sleep_s: 0.10
     bankroll_refresh_s: 5.0
-    intents_per_min_cap: 3600    
+    intents_per_min_cap: 3600
     max_edges_per_market: 8
     max_plans_per_loop: 64
-
-    # new (event-driven micro-coalescing / watchdog)
-    debounce_ms: 8      # coalesce tiny WS bursts (~5–10ms typical)
-    watchdog_ms: 100    # wake even if no deltas (best-effort tick)
-    max_batch_ms: 20    # hard cap on coalescing window
-
-
-
-
-
+    debounce_ms: 8
+    watchdog_ms: 100
+    max_batch_ms: 20
