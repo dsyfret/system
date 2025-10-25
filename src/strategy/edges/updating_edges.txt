@@ -56,4 +56,13 @@ feature_flags.yaml key, edges.yaml block name, profiles’ disable_edges entries
 
 Dashboard/alert label strings (only if you want bespoke panels; otherwise metrics still flow under generic labels)
 
+
 Ensure your edge emits an edge_id that classifies as intended (especially for maker variants)
+
+
+-->Note that much of the above is outdated!! I've tried to remove 'hardwired' edge footprints, to leave the universal system edge-agnostic. Note the following advice when adding new edges (as of 25Oct2025):
+
+When you add the next edge
+Create src/strategy/edges/<new_edge>.py with def run(ctx: StrategyContext) -> List[EdgeProposal].
+Add to edges.registry and edges.enabled.
+If it needs queue signals/MBR, read them from ctx.book exactly like Maker.
