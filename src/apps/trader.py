@@ -25,6 +25,7 @@ from ..core.metrics import start_metrics_server, inc, set_gauge
 from ..betfair.streaming import StreamingClient
 from ..betfair.rest import RestClient
 from ..betfair.book_builder import BookBuilder
+from ..strategy.hotloop.api import Hotloop
 from ..betfair.order_stream import OrderStreamClient, OrderWatcher
 from ..betfair.heartbeat import HeartbeatPinger
 from ..betfair.accounts import AccountsClient, AccountFundsPoller
@@ -152,12 +153,13 @@ class TraderApp:
         # Streams/REST
         self.stream = StreamingClient(self.profile)
         self.rest = RestClient(self.profile)
-        # (CHANGED) pass queue_signals config into BookBuilder
+        # Book state + signals seam wrapper
         self.book = BookBuilder(queue_cfg=getattr(self.cfg, 'queue_signals', {}) or {})
+        self.hotloop = Hotloop(self.book, config=getattr(self.cfg, 'hotloop', {}) or {})
 
         # (MBR to Sizer logs)
         try:
-            self.sizer.set_mbr_resolver(self.book.get_mbr)
+            self.sizer.set_mbr_resolver(self.hotloop.get_mbr)
         except Exception:
             pass
 
@@ -715,7 +717,7 @@ class TraderApp:
                                 selection_id=None,  # edge may iterate runners
                                 snapshot=snap,
                                 cfg=(getattr(self.cfg, "edges", {}) or {}).get(edge_name, {}) or {},
-                                book=self.book,
+                                book=self.hotloop,
                                 now_ms=now_ms,
                                 edge_id=edge_name,
                             )
