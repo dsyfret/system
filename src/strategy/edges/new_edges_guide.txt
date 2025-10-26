@@ -1,0 +1,67 @@
+Here’s a practical, “do-this-not-that” playbook for adding new edges now that you’re (a) edge-agnostic and (b) seam-ready.
+Edge contract and calling shape
+• Implement edges as pure functions taking a StrategyContext and returning a list of EdgeProposal. Do not rely on cfg mutation or positional “cfg as 3rd arg”.
+• Keep all reads through the seam: use ctx.book (Hotloop) for signals; use ctx.snapshot for runner loop/materialized state; use ctx.now_ms for time.
+• Never call BookBuilder directly; if you need a new primitive (e.g., top-N ladder), request it as an additive Hotloop method with capabilities() gating.
+Config and loader
+• Register each edge in edges.registry: edge_name → module:Symbol.
+• Enable it by name in edges.enabled (order indicates desired precedence only insofar as the Arbiter consults lane_priority).
+• All knobs live under edges.<edge_name>.. Avoid putting edge-specific settings under arbiter., risk.*, or global unless they’re truly cross-edge (e.g., global per-runner liability cap).
+• Use small, explicit blocks: {overlays:{…}}, {hedge:{…}}, and simple numeric gates (min_depth, max_spread_ticks, freshness_ms, ttl_ms).
+Lane mapping and arbitration
+• Add a mapping in arbiter.lane_of for your edge name and confirm lane_priority already orders it sensibly against the rest (e.g., suspend_reopen > maker > cross_market > mean_revert > xmsr).
+• Do not duplicate hygiene in the edge. Min lifetime, replace pacing, widen triggers, and per-runner liability enforcement are Arbiter responsibilities. The edge proposes; Arbiter decides.
+IDs, attribution, and bundles
+• Start every EdgeProposal.edge_id with your edge’s short name prefix (e.g., xmsr_back_probe, parity_pair_lay). That keeps hedge-on-fill and dashboards edge-agnostic.
+• If you emit multi-leg ideas, set a bundle_id and a bundle_policy (ALL_OR_CANCEL or BEST_EFFORT) on the intents produced downstream; your proposals should carry enough rationale to reconstruct them if needed.
+• Add edge_contribs entries (edge_id, ev_net_ticks, weight) to help downstream analytics and hedge logic.
+Signal usage patterns (with Hotloop)
+• Strength: rely on primitives that generalize: spread_ticks, best2_sum, size_ahead, match_rate_ema, pfill_ttf, last_traded_ts_ms, get_mbr. If you can compose a feature from these in Python, prefer that to asking for a new primitive.
+• Guard patterns:
+– Liquidity: best2_sum above a floor; spread within [min,max]; pfill_ttf.ttf_ms under a cap; pfill_ttf.p_fill above a floor.
+– Freshness: reject if last_traded_ts_ms is stale beyond your edge’s horizon.
+– Commission: if get_mbr returns None, assume profile default; otherwise pass the pct into EV logic.
+• Capability gates: if you must use an optional primitive (e.g., future sweep_sniffer), check ctx.book.capabilities().get("sweep_sniffer") before calling, and degrade gracefully.
+Sizing and economics
+• EdgeProposal should carry ev_net_ticks (conservative) and size_hint. Do not compute final stake; the Sizer owns bankroll, clamps, and MBR.
+• Avoid “price-pegged” proposals that assume immediate replace freedom; Arbiter pacing and min_lifetime will deliberately slow churn. Prefer prices that survive a modest delay.
+• Be explicit with TTL expectation via ttl_ms in the proposal; Arbiter may extend min_lifetime_ms, but short-TTL edges (e.g., S→R, XMSR) should declare intent.
+Hedging behavior
+• If an edge wants hedge-on-fill, define edges.<edge>.hedge.enabled: true with cushion_ticks and ttl_ms. The generic hedge listener will act based on your edge_id prefix—no edge-specific wiring in Trader.
+Safety and global caps
+• Respect global risk.per_runner_liability_cap. Your edge should not attempt to “work around” caps; if you need a local cap (e.g., stack levels), enforce it inside the edge as a strict ≤ limit on your own proposals.
+• Never emit off-tick or out-of-bounds prices; call the same tick helper used elsewhere (Sizer and QuoteIntent.snapped will catch this, but don’t rely on cleanup).
+Performance and churn discipline
+• Be intentional about proposal volume. Rule of thumb: ≤2 primary proposals per runner (one per side) and only add overlays (stacking/levels) under heavy liquidity and narrow spreads.
+• Honor the event-driven loop: do not spin on time; recompute only when deltas arrive. If you need coalescing, rely on the loop’s debounce (you already have it).
+• Use queue-aware drops early: if p_fill is too low or ttf too high, suppress proposals before they burden Arbiter/Sizer.
+Observability and runbook hygiene
+• Log a terse rationale per proposal (edge_id, spread_ticks, depth, gate decisions). Your dashboards already parse these.
+• Emit counters for suppression reasons if you have togglable overlays (e.g., “xmsr.drop.low_confidence_total”).
+• Keep your config’s default OFF for new overlays; add them to edges.<edge>.overlays but leave enabled: false until soaked.
+Testing and acceptance
+• CE/replay harness: add fixtures that cover your edge’s gates (thin book, wide spreads, stale markets, pre-off). Assert proposal counts and key rationale markers.
+• Acceptance criteria per edge should include: no off-tick, obeys Arbiter min_lifetime, respects global cap, keeps replace:place under your budget, and doesn’t increase fee-share at equal mark-out.
+Cannibalization and coordination
+• If an edge can pre-empt Maker (e.g., XMSR), ensure Arbiter sees it in a higher-priority lane and emits a structured “suppressed” log when it displaces Maker. That protects PnL and makes paneling easy.
+• Conversely, if your edge is secondary, tolerate being suppressed and avoid re-issuing identical proposals immediately after being pre-empted.
+Failure modes and fallbacks
+• Treat missing signals as “no-op”: if Hotloop returns None/0 for a key signal, skip proposals rather than guessing.
+• Avoid raising exceptions from the edge path; return an empty list when input is insufficient or gates fail.
+• Keep any edge-local state small and resettable; avoid memory growth per market/runner.
+Configuration ergonomics
+• Prefer simple numerics and booleans; avoid deeply nested structures.
+• For parameters that need profile-based overrides, support a small params map and look up by profile key (you already have this pattern under maker.params).
+• Document defaults in edges.yaml next to each knob; default to strict/safe gates.
+Rollout plan for each new edge
+• Start with enabled: false.
+• Dry-run observer mode if applicable (emit proposals but gate to FeeGate=false, or log only).
+• Flip to true with tight gates, soak on low-impact markets, then widen gates after inspecting counters and fee_share/replace:place.
+Compatibility with future Rust
+• Keep the edge dependent only on ctx.book primitives and plain Python data (EdgeProposal dict or dataclass). If you later move Hotloop to Rust, your edge remains unchanged.
+• If you add a new universal primitive, propose it as an additive Hotloop method with a Python fallback before you rely on it. That prevents seam churn and unblocks Rust parity later.
+Naming and housekeeping
+• File name: src/strategy/edges/<edge_name>.py; registry key matches the module symbol.
+• Keep module-level propose(ctx) or run(ctx) as the only import surface. Avoid global singletons; accept all services through ctx.
+• Prefix logs and metrics with your edge’s name consistently. It matters for dashboards and filters.
+If you follow the above, you’ll keep the “universal” pipeline truly edge-agnostic: edges plug in through one loader, read the same seam, are judged by the same Arbiter/Sizer, and flow through the same executor—with zero special-case plumbing in core.
