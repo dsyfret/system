@@ -61,6 +61,8 @@ def snapped_price(price: float) -> float:
 
 @dataclass(frozen=True)
 class QuoteIntent:
+    # Wire schema version (freeze seam). Increment on breaking changes.
+    v: int = 1
     # Identity
     intent_id: str
     market_id: str
@@ -101,6 +103,7 @@ class QuoteIntent:
         JSON-serialisable dict. Keep keys/shape stable.
         """
         d = asdict(self)
+        d["v"] = int(self.v)
         # Ensure canonical ENUM strings
         d["side"] = str(self.side)
         d["tif"] = str(self.tif)
@@ -132,6 +135,7 @@ class QuoteIntent:
                 bp_norm = s  # type: ignore[assignment]
 
         return QuoteIntent(
+            v=int(d.get("v", 1)),
             intent_id=str(d["intent_id"]),
             market_id=str(d["market_id"]),
             selection_id=int(d["selection_id"]),
@@ -165,3 +169,4 @@ class QuoteIntent:
             return replace(self, price=p)
         except Exception:
             return self
+
