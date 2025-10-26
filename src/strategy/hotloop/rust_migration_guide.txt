@@ -1,0 +1,118 @@
+Title: Rust migration guide — what to change, where, and in what order
+Scope
+• Phase 1: move the book/queue/signal hot path to Rust (PyO3), keeping the executor in Python.
+• Phase 2 (optional): move the executor into a Rust sidecar process over a small TCP wire, keeping strategy logic in Python.
+PHASE 1 — Signals seam to Rust (PyO3)
+What you build in Rust
+• New crates:
+– hotloop-core (pure Rust): holds state per market/runner, applies snapshots/deltas, computes signals (best levels, best2 depth, spread, size_ahead, match-rate EMA, p_fill, ttf, last_traded_ts). Release the GIL in every exported method.
+– hotloop-py (PyO3): exposes a Python class Hotloop with the same method names and argument types you already use. It wraps hotloop-core and implements update_config, apply_snapshot, apply_delta, best, best2_sum, spread_ticks, size_ahead, match_rate_ema, pfill_ttf, get_mbr, last_traded_ts_ms, capabilities. Optional stubs (sweep_sniffer, big_move_trigger, rf_seen_recently, trend_lens) can remain False/no-op until implemented.
+Repository structure additions
+• rust/hotloop-core/… (Cargo.toml, src/lib.rs)
+• rust/hotloop-py/… (Cargo.toml, src/lib.rs; maturin build config)
+• scripts/build_hotloop.sh (one-liner that runs maturin build and copies the wheel into your venv or dist/)
+Python build/packaging steps
+• Add maturin to the dev toolchain, pin Rust toolchain version (rustup toolchain file).
+• CI: add a job that builds hotloop-py wheels for your target Python versions and OS (Linux x86_64 for VPS). Publish wheel artifacts.
+Changes in your Python codebase (by file)
+src/strategy/hotloop/api.py
+• Replace the current delegating implementation with the PyO3-backed class. Keep the class name and public methods identical.
+• Preserve capabilities() and return True for methods you fully implement (size_ahead, match_rate_ema, pfill_ttf, etc.). Keep experimental detectors as False until done.
+• Ensure update_config accepts a Python dict and passes a compact, validated map into Rust.
+src/apps/trader.py
+• In init, you already build BookBuilder and a Hotloop wrapper. For the Rust version:
+– Keep BookBuilder until you fully migrate ingest. Initially, you can continue feeding BookBuilder (no behavior change) while Hotloop reads from Rust state.
+– When ready to go all-in on Rust for state: pipe deltas directly to Hotloop.apply_delta instead of BookBuilder.apply_delta, and only call BookBuilder if some downstream code still needs snapshots for logging. The edges and sizer should not depend on BookBuilder directly—ensure StrategyContext.book is the Hotloop instance (you’ve already done this).
+• Sizer MBR resolver: if Rust Hotloop assumes ownership of MBR, route sizer.set_mbr_resolver(self.hotloop.get_mbr). You already do this; just confirm get_mbr returns the same values.
+src/strategy/context.py (or wherever StrategyContext lives)
+• No change in public shape. Confirm ctx.book remains the seam object (Hotloop). Edges continue to call ctx.book.*.
+src/strategy/edges/*
+• No changes required if they already use ctx.book primitives only. Verify no edge imports BookBuilder or calls its internals. If any do, refactor to use ctx.book.
+• If an edge needs ladder slices, add a generic ladder_top(market_id, runner_id, side, n=3, raw=True) method to Hotloop (capability-gated) and implement it in Rust and Python fallback.
+src/betfair/book_builder.py
+• No interface changes needed. Optional:
+– Disable queue EMA and p_fill/ttf in BookBuilder once the Rust Hotloop owns those computations, to avoid double work.
+– Keep reseed helpers for operational safety and simulator paths if you still use them.
+src/tools/simulator/replay.py
+• If you want the most accurate performance tests, add a flag to feed raw WebSocket JSON lines directly into Hotloop.apply_delta(raw_json, ts_ms) so Rust parses JSON with serde/simdjson bindings. Keep the existing normalized delta path as a fallback.
+Configuration
+• base.yaml: optionally add a hotloop block with tunables you want Rust to consume (queue window, min_obs_s, max_ttf_ms, detector thresholds). Python remains the single source of truth and calls hotloop.update_config at boot and when configs reload.
+Observability and errors
+• Logging: expose a tiny emit(event_dict) callback from Python to the PyO3 object so Rust can report counters/diagnostics; Python forwards them to your existing logger/metrics.
+• Errors: Rust returns Result<T, Error> that PyO3 maps to Python exceptions; catch in trader.py around apply_delta and increment a seam error counter.
+Validation and acceptance
+• Run CE fixtures and simulator replays and compare:
+– Intent counts per minute (by edge), replace:place ratio, fee share.
+– Marker: last-traded ts, p_fill distributions, ttf histograms.
+• Performance gates:
+– Average apply_delta time: tens of microseconds on VPS.
+– pfill_ttf call: tens of microseconds.
+– End-to-end decision loop (stream delta → intents): lower p50/p95 and tighter p99, with equal outputs.
+Rollback
+• Keep a feature flag profile.hotloop.enabled. If disabled, fall back to the Python Hotloop wrapper (the delegating version). The class name stays the same, so rollout is a one-line toggle.
+PHASE 2 — Executor to Rust (sidecar process)
+What you build in Rust
+• rust/executor/ binary that:
+– Accepts QuoteIntent v=1 and emits ExecutionReport v=1.
+– Implements place/replace/cancel, pacing and TTL enforcement, idempotency keyed by intent_id, error-ladder mapping, heartbeat, Prometheus/JSON metrics.
+– Talks to Betfair with robust retry/backoff; graceful reconnect handling.
+Wire protocol
+• Length-prefixed JSON over TCP on localhost (u32 big-endian length followed by UTF-8 JSON). Keep it simple and robust.
+• Control messages:
+– HELLO/HELLO_ACK: exchange wire version and capabilities.
+– HEARTBEAT: executor → Python, at a fixed cadence.
+Changes in your Python codebase (by file)
+src/execution/executor_py/router.py (or wherever you publish intents)
+• Introduce a small client Transport that:
+– Connects to localhost:port, manages a bounded send queue, frames messages, and handles reconnect with backoff.
+– Serializes QuoteIntent.to_wire() (it already includes v).
+– Reads ExecutionReport.from_wire() from the socket and pushes it into your IPC as if the in-proc executor had produced it.
+• Add health checks: if heartbeat not seen within N seconds, mark executor unhealthy and pause intent publishing (or route to Python executor fallback if you keep one).
+src/apps/trader.py
+• At boot, choose executor transport by config:
+– execution.backend: "python" or "rust".
+– If "rust", start the TCP client and point the router at it.
+• Hedge-on-fill listener remains unchanged: it reads ExecutionReports from IPC (now produced by the TCP client) and builds hedge intents the same way.
+src/execution/interfaces/intents.py and src/execution/interfaces/reports.py
+• You already added v=1 to QuoteIntent; add v=1 to reports (done via your earlier patch). No further changes required.
+• If the Rust executor uses different enum strings, normalize them in the TCP client before building ExecutionReport (map to your existing Action values).
+src/execution/ack_tracker.py
+• No changes if ExecutionReport fields are preserved. If you adopt fill_events in the future, optionally aggregate VWAP using the list; keep backward compatibility with fill_price/fill_size.
+src/monitoring/*
+• Add panels for:
+– Executor heartbeats, reconnects, pacing trips, TTL prevents.
+– Intent→ACK latency histogram sourced from reports.
+• Add alerts for missed heartbeats, rising reject_code counts, and idempotency duplicates detected.
+Deployment and runtime
+• Supervisor: run the Rust executor as a separate supervised service (systemd or your process manager) with stdout logs. Python-side watchdog restarts the service if heartbeats are missed (or instructs ops).
+• Security: bind to 127.0.0.1 only; no external exposure.
+• Resource limits: set a sensible file descriptor and memory cap.
+Validation and acceptance
+• Dry run with execution.dry_run: true to validate flow without live orders.
+• Live micro-soak with tiny stakes:
+– Intent→ACK P99 meets target on your VPS.
+– No duplicate placements on reconnect (idempotency green).
+– Pacing and TTL metrics healthy; funds mismatch tripwire stays quiet.
+Rollback
+• Switch execution.backend back to "python". The TCP client closes and Router reuses in-proc executor.
+Operational checklists
+Pre-flight
+• CI builds wheels for hotloop-py and the executor binary for your target.
+• Feature flags default to Python paths; Rust paths guarded by config.
+• Dashboards updated for new metrics; alerts configured.
+Cutover (signals)
+• Enable hotloop.rust: true on a single profile; verify metrics and parity; ramp to all profiles.
+Cutover (executor)
+• Start the sidecar on host; verify HELLO handshake and heartbeat in logs.
+• Flip execution.backend to "rust" for one profile in dry_run; validate intents/reports loop.
+• Unset dry_run for a controlled market set; monitor cannibalization logs, pacing, and fee share.
+Post-cut
+• Keep both paths available for at least one release cycle for easy rollback.
+• Document the wire and capability versions in a small compatibility matrix in the repo (Hotloop API version ↔ config bundle version; executor wire version ↔ strategy commit).
+What does not change
+• Strategy code: selector, edges, arbiter, sizer, fee gate, dashboards, CE/simulator harness stay in Python.
+• Configuration ownership: YAML remains the single source of truth; Python loads it and calls update_config on Rust components.
+• Edge-agnosticism: new edges keep using ctx.book (Hotloop) and emit the same QuoteIntent; no seam churn expected.
+If you follow this, the switch to Rust is a controlled, modular swap:
+• Phase 1 replaces internals of a class you already depend on (Hotloop), so callers don’t move.
+• Phase 2 replaces the executor behind a wire you’ve already frozen, so strategy code still doesn’t move.
