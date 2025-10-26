@@ -248,3 +248,10 @@ profile:
     debounce_ms: 8
     watchdog_ms: 100
     max_batch_ms: 20
+
+hotloop:
+  # placeholders for future Rust thresholds; currently unused by the Python adapter
+  queue_window_s: 5
+  min_obs_s: 1
+  max_ttf_ms: 15000
+
