@@ -23,8 +23,6 @@ MBR logging
 - Call `sizer.set_mbr_resolver(book.get_mbr)` at init time (optional).
 - If set, logs will include: applied_mbr_pct, mbr_source.
 """
-import time
-
 
 from __future__ import annotations
 import time
@@ -72,7 +70,7 @@ class Sizer:
         if stake <= 0.0:
             return None
         intent = QuoteIntent(
-            intent_id=f"ARB:{getattr(plan, 'edge_id', 'arbiter')}:{int(self._now()*1000)}",
+            intent_id=f"ARB:{getattr(plan, 'edge_id', 'arbiter')}:{_now_ms()}",
             market_id=proposal.market_id,
             selection_id=proposal.selection_id,
             side=side,
@@ -84,7 +82,7 @@ class Sizer:
             max_replace_rate_per_min=60,
             edge_contribs=list(getattr(plan, 'edge_contribs', []) or []),
             risk_tags={'source': 'arbiter'},
-            client_ts_ms=int(self._now()*1000),
+            client_ts_ms=_now_ms(),
             bundle_id=proposal.bundle_id,
             bundle_policy=proposal.bundle_policy,
         )
@@ -170,6 +168,43 @@ class Sizer:
         """
         self._mbr_resolver = resolver
 
+    # ------------- Basic-mode helpers (per-edge overrides & mode selection) -------------
+    def _edge_sizing_cfg(self, edge_id: str) -> dict:
+        if not self.basic_allow_edge_over:
+            return {}
+        try:
+            e = self._edges_cfg.get(edge_id, {}) or {}
+            return dict(e.get("sizing", {}) or {})
+        except Exception:
+            return {}
+
+    def _resolve_mode(self, edge_id: str | None) -> str:
+        if edge_id:
+            ov = self._edge_sizing_cfg(str(edge_id)).get("mode")
+            if ov:
+                return str(ov).lower()
+        return self.mode_global
+
+    def _resolve_basic_params(self, edge_id: str | None, side: str) -> tuple[float, float]:
+        """
+        Returns (stake_for_back, liability_target_for_lay) after applying per-edge overrides and side multipliers.
+        """
+        cfg = self._edge_sizing_cfg(edge_id or "")
+        stake = float(cfg.get("default_stake", self.basic_default_stake))
+        liab  = float(cfg.get("default_liability", self.basic_default_liab))
+        try:
+            sm = cfg.get("side_mult", {}) or {}
+            mult_back = float(sm.get("BACK", 1.0))
+            mult_lay  = float(sm.get("LAY", 1.0))
+        except Exception:
+            mult_back, mult_lay = 1.0, 1.0
+        if str(side).upper() == "BACK":
+            stake *= mult_back
+        else:
+            liab *= mult_lay
+        return stake, liab
+
+           
     # ---------------- Public API ---------------- #
 
     async def size_async(
@@ -229,12 +264,78 @@ class Sizer:
             return 0.0, "price_off_tick", details
 
         # ---------- Basic validity ----------
-        if ev_ticks <= 0.0 or bankroll <= 0.0:
+        if bankroll <= 0.0:
             details = _details(self, proposal, bankroll, 0.0, 0.0, 0.0, 0.0, 0.0, side, price, risk_multiplier)
             details.update(self._mbr_context(getattr(proposal, "market_id", None)))
             log_event("sizing", "size.block", "invalid inputs", **details)
             return 0.0, "invalid", details
 
+        # ---------- Sizing mode selection ----------
+        edge_id = str(getattr(proposal, "edge_id", "") or "")
+        mode = self._resolve_mode(edge_id)
+        liab_per_unit = 1.0 if side == "BACK" else max(0.0, price - 1.0)
+
+        if mode == "basic":
+            # Optional EV gate in basic mode
+            if self.basic_require_pos_ev and float(getattr(proposal, "ev_net_ticks", 0.0) or 0.0) <= 0.0:
+                details = _details(self, proposal, bankroll, 0.0, 0.0, 0.0, 0.0, 0.0, side, price, risk_multiplier)
+                details.update(self._mbr_context(getattr(proposal, "market_id", None)))
+                log_event("sizing", "size.block", "basic_ev_gate", **details)
+                return 0.0, "ev_gate", details
+
+            # Resolve basic params (BACK uses fixed stake; LAY uses fixed liability target)
+            stake_back, liab_target = self._resolve_basic_params(edge_id, side)
+            if side == "BACK":
+                base_stake = max(0.0, stake_back)
+            else:
+                if liab_per_unit <= 0.0:
+                    details = _details(self, proposal, bankroll, 0.0, 0.0, 0.0, 0.0, 0.0, side, price, risk_multiplier)
+                    details.update(self._mbr_context(getattr(proposal, "market_id", None)))
+                    log_event("sizing", "size.block", "basic_invalid_price_for_lay", **details)
+                    return 0.0, "invalid_lay_price", details
+                base_stake = max(0.0, liab_target / liab_per_unit)
+
+            # Your existing caps
+            per_market_cap = bankroll * self.per_market_max_pct
+            stake_capped_market = min(base_stake, per_market_cap)
+
+            cap_pct_abs = bankroll * self.per_minute_new_risk_pct
+            minute_cap_abs = max(cap_pct_abs, float(self.per_minute_new_risk_abs or 0.0))
+            remaining_minute_abs = max(0.0, minute_cap_abs - self._bucket_new_risk)
+
+            if liab_per_unit <= 0.0:
+                minute_capped_stake = 0.0
+            else:
+                minute_capped_stake = min(stake_capped_market, remaining_minute_abs / liab_per_unit)
+
+            stake = max(0.0, minute_capped_stake)
+
+            # Minimum stake floor
+            if 0.0 < stake < self.min_stake:
+                details = _details(
+                    self, proposal, bankroll, 0.0, 0.0, base_stake,
+                    per_market_cap, minute_cap_abs, side, price, risk_multiplier,
+                    liab_per_unit=liab_per_unit, new_risk_abs=stake * liab_per_unit, stake=stake
+                )
+                details["clamp_reason"] = "STAKE_BELOW_MIN"
+                details["min_stake"] = float(self.min_stake)
+                details.update(self._mbr_context(getattr(proposal, "market_id", None)))
+                log_event("sizing", "size.block", "basic_stake_below_min", **details)
+                return 0.0, "stake_below_min", details
+
+            # Record new risk and log
+            new_risk_abs = stake * liab_per_unit
+            self._bucket_new_risk += new_risk_abs
+
+            details = _details(
+                self, proposal, bankroll, 0.0, 0.0, base_stake,
+                per_market_cap, minute_cap_abs, side, price, risk_multiplier,
+                liab_per_unit=liab_per_unit, new_risk_abs=new_risk_abs, stake=stake
+            )
+            details.update(self._mbr_context(getattr(proposal, "market_id", None)))
+            log_event("sizing", "size.pass", "basic_sized", **details)
+            return float(stake), "ok", details
+               
         # --- Convert ticks → edge% at this price ---
         tick_w = _tick_size(price)
         edge_pct = max(0.0, ev_ticks * tick_w / price)  # fractional edge (e.g. 0.003 = 0.3%)
@@ -381,3 +482,4 @@ def _suggest_snap(price: float) -> Optional[float]:
     except Exception:
 
         return None
+
