@@ -157,6 +157,14 @@ edges:
       enabled: true
       cushion_ticks: 1
       ttl_ms: 3000
+    sizing:
+      mode: basic                 # optional; otherwise inherits global
+      default_stake: 2.0
+      default_liability: 2.0
+      side_mult:
+        BACK: 1.0
+        LAY: 1.0
+
 
   mean_revert:
     enabled: false
@@ -254,4 +262,5 @@ hotloop:
   queue_window_s: 5
   min_obs_s: 1
   max_ttf_ms: 15000
+
 
