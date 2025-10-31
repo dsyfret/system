@@ -51,5 +51,14 @@ risk:
   odds:
     min: 1.01
     max: 1000.0
+sizing:
+  mode: kelly            # "kelly" (default) or "basic"
+  kelly_fraction: 0.25   # already used by your current logic
+  basic:
+    default_stake: 2.0         # used for BACK in basic mode
+    default_liability: 2.0     # used for LAY in basic mode
+    require_positive_ev: true  # block if EV<=0 in basic mode
+    allow_edge_overrides: true # edges may override these
+
 
 
