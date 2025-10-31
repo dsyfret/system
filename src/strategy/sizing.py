@@ -131,6 +131,19 @@ class Sizer:
         # --- Safety floor: min stake ---
         self.min_stake: float = float(getattr(snap, "risk", {}).get("min_stake", 2.0))  # default 2.0 unless configured
 
+        # ---- Sizing mode & basic parameters ----
+        sz = getattr(snap, "risk", {}).get("sizing", {})  # type: ignore[attr-defined]
+        self.mode_global: str = str(sz.get("mode", "kelly")).lower()
+        self.basic_cfg: dict = dict(sz.get("basic", {}))
+        self.basic_default_stake: float = float(self.basic_cfg.get("default_stake", 2.0))
+        self.basic_default_liab: float = float(self.basic_cfg.get("default_liability", 2.0))
+        self.basic_require_pos_ev: bool = bool(self.basic_cfg.get("require_positive_ev", True))
+        self.basic_allow_edge_over: bool = bool(self.basic_cfg.get("allow_edge_overrides", True))
+
+        # Per-edge sizing overrides resolver (reads from loaded config snapshot)
+        self._edges_cfg = getattr(snap, "edges", {}) if hasattr(snap, "edges") else {}
+
+               
         # Allow runtime overrides if provided
         if cfg_override:
             self.per_market_max_pct = float(cfg_override.get("per_market_max_pct", self.per_market_max_pct))
@@ -366,4 +379,5 @@ def _suggest_snap(price: float) -> Optional[float]:
     try:
         return float(_snap(price))
     except Exception:
+
         return None
